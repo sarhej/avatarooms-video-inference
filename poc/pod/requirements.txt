@@ -44,3 +44,9 @@ python-multipart>=0.0.12
 # imageio is what diffusers.utils.export_to_video uses under the hood
 imageio>=2.36.0
 imageio-ffmpeg>=0.5.1
+
+# PyAV: required by diffusers.pipelines.ltx2.export_utils.encode_video for
+# muxing video + audio into MP4 with proper streams. Without it the helper
+# raises ImportError at the very end of /generate, after the model already
+# burned 20+s of GPU time on inference.
+av>=14.0.0
