@@ -272,13 +272,27 @@ def _reset_peak_vram() -> None:
         pass
 
 
+def _round32(x: int) -> int:
+    """Round to nearest multiple of 32. LTX-2 hard-rejects non-multiple-of-32 w/h."""
+    return max(32, ((x + 16) // 32) * 32)
+
+
 def _resolution_to_hw(resolution: str, aspect_ratio: str) -> tuple[int, int]:
-    base = {"720p": 720, "1080p": 1080}[resolution]
+    """Map shorthand → LTX-2 (width, height), snapped to multiples of 32.
+
+    Convention: "720p" / "1080p" labels the SHORT side, matching how phone
+    portrait video is talked about (e.g. 1080p portrait = 1080 wide × 1920
+    tall, not 1080 tall × 607 wide).
+    """
+    short_side = {"720p": 720, "1080p": 1080}[resolution]
+    long_side = short_side * 16 // 9  # 1280 for 720p, 1920 for 1080p
     if aspect_ratio == "9:16":
-        return (base * 9 // 16, base)
-    if aspect_ratio == "16:9":
-        return (base, base * 9 // 16)
-    return (base, base)
+        w, h = short_side, long_side
+    elif aspect_ratio == "16:9":
+        w, h = long_side, short_side
+    else:  # "1:1"
+        w, h = short_side, short_side
+    return _round32(w), _round32(h)
 
 
 def _encode_video(
