@@ -111,9 +111,20 @@ echo $POD_AUTH_TOKEN   # ← keep this, you'll paste it into the RunPod env vars
 
 1. Go to https://www.runpod.io/console/deploy
 2. **GPU type**: `H100 SXM` 80 GB VRAM (Community or Secure Cloud)
-3. **Template**: click **Official** filter → pick **"Runpod Pytorch 2.8.0"**
-   - Image tag: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
-   - Provides Python 3.12, torch 2.8.0+cu128, CUDA 12.8.1, Ubuntu 24.04
+3. **Template** — THIS IS THE #1 CAUSE OF FAILED DEPLOYS. Read carefully:
+   - Click the **Official** filter at the top of the template picker.
+   - Search for the **exact** image tag `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`.
+     The template name in the UI is **"Runpod Pytorch 2.8.0"** but RunPod
+     sometimes also exposes older "PyTorch" or "RunPod Pytorch 2.4" entries
+     near the top — those will NOT work (LTX-2 requires torch >= 2.7).
+   - Verify the **exact image tag** in the right-hand template panel before
+     clicking Deploy. The tag MUST contain `torch280` and `cu1281`.
+   - Provides Python 3.12, torch 2.8.0+cu128, CUDA 12.8.1, Ubuntu 24.04.
+   - The bootstrap script has a hard guard that detects torch < 2.7 or
+     Python < 3.12 and halts (`sleep infinity`) instead of letting the pod
+     restart-loop. If your deploy hangs after the banner with a "WRONG RUNPOD
+     TEMPLATE" message in logs, you picked the wrong template — terminate
+     and redeploy.
 4. Open the **Pod template overrides** dialog and set exactly:
 
    | Field | Value |
@@ -389,7 +400,10 @@ wipes partial state from any prior failed runs, and continues.)
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Bootstrap fails at `LTX2Pipeline` import | diffusers version too old | edit `poc/pod/requirements.txt`, swap the pinned diffusers for `diffusers @ git+https://github.com/huggingface/diffusers.git@main`, re-run bootstrap |
+| Pod logs show `[bootstrap] WRONG RUNPOD TEMPLATE` and bootstrap is sleeping | RunPod template ships torch 2.4 / Py3.11 instead of torch 2.8 / Py3.12 | **Terminate** the pod (don't try to fix in place) and redeploy with the **exact** `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` image tag. Bootstrap intentionally halts instead of letting RunPod restart-loop and burn money. |
+| Pod logs show the CUDA banner + `Python 3.11` / `torch 2.4.x` repeated dozens of times every ~30 s | Same as above — wrong template causing diffusers to fail to build from source, container exits, RunPod auto-restarts | **Terminate immediately** (every restart cycle costs money), then redeploy with the correct template |
+| `infer_schema(func): Parameter input has unsupported type torch.Tensor` when loading LTX2Pipeline | torch < 2.7 cannot resolve string forward references in diffusers' FP8 grouped-matmul custom op | Same as the wrong-template row — you need torch ≥ 2.7. Terminate and redeploy. |
+| Bootstrap fails at `LTX2Pipeline` import on a torch≥2.7 pod | diffusers pinned version (0.36.0) predates the FP8 schema fix | edit `poc/pod/requirements.txt`, swap the pinned diffusers for `diffusers @ git+https://github.com/huggingface/diffusers.git@main`, re-run bootstrap |
 | `RuntimeError: CUDA out of memory` at load | other process holding VRAM | `nvidia-smi`, kill stragglers, restart pod |
 | `RuntimeError: CUDA out of memory` at batch=3 | LTX-2 + text encoder + activations exceeds 80 GB | drop batch to 2, or enable `pipe.enable_model_cpu_offload()` in `server.py` |
 | `/generate` returns 401 | bearer token mismatch | re-export `POD_AUTH_TOKEN` in both runner and pod |

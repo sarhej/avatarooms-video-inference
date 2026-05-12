@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 # LTX-2 POC pod bootstrap.
 #
-# Run on a freshly-rented RunPod H100 pod. Expects the "PyTorch 2.7 / CUDA 12.7"
-# template (or any image with torch>=2.7, cuda>=12.7, python>=3.10 already
-# installed). Idempotent — safe to re-run.
+# Run on a freshly-rented RunPod H100 pod. REQUIRES the official template
+#   runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+# which ships torch 2.8 / Python 3.12 / CUDA 12.8 / Ubuntu 24.04.
+#
+# Any image with torch<2.7 or python<3.12 (e.g. the default "PyTorch" RunPod
+# entry which is torch 2.4 / Py3.11) will hit a `from __future__ annotations`
+# vs `torch.library.infer_schema` incompatibility when importing LTX2Pipeline
+# from diffusers, and the container will restart-loop. The hard guard below
+# detects this and halts with a sleep instead of letting RunPod loop.
+#
+# Idempotent — safe to re-run.
 #
 #   curl -sSL https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh | bash
 #
@@ -75,16 +83,48 @@ mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}"
 
 log "Sanity check: GPU + Python versions"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || {
-  echo "ERROR: nvidia-smi failed — no GPU?"; exit 1;
+  echo "ERROR: nvidia-smi failed — no GPU?"; sleep infinity
 }
 python3 --version
 python3 -c 'import torch, sys; print("torch", torch.__version__, "cuda", torch.cuda.is_available())'
 
+# ---------------------------------------------------------------------------
+# HARD GUARD: refuse to proceed on wrong template.
+#
+# LTX-2 with diffusers requires torch>=2.7 and python>=3.12. If someone picks
+# the wrong RunPod template (e.g. the default "PyTorch" entry that ships
+# torch 2.4 / Py3.11), pip will silently fail to build diffusers from git and
+# the container will exit, causing RunPod's auto-restart to loop forever and
+# burn money. Detect this up front, print a loud error, and `sleep infinity`
+# so the operator gets time to see the diagnostic before terminating the pod.
+# ---------------------------------------------------------------------------
+PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3,12) else 0)')
+TORCH_OK=$(python3 -c 'import torch; v=tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]); print(1 if v >= (2,7) else 0)')
+if [[ "${PY_OK}" != "1" ]] || [[ "${TORCH_OK}" != "1" ]]; then
+  echo ""
+  echo "=================================================================="
+  echo "  WRONG RUNPOD TEMPLATE"
+  echo "=================================================================="
+  echo "  This pod has Python $(python3 -V 2>&1 | awk '{print $2}')"
+  echo "  and torch $(python3 -c 'import torch; print(torch.__version__)')."
+  echo ""
+  echo "  LTX-2 requires Python >= 3.12 AND torch >= 2.7."
+  echo ""
+  echo "  Fix: TERMINATE this pod and redeploy with the template"
+  echo "       runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+  echo "       (filter by 'Official' in the RunPod template picker)."
+  echo ""
+  echo "  Sleeping forever to prevent restart-loop money burn."
+  echo "  See poc/README.md Step 2 for the correct deploy parameters."
+  echo "=================================================================="
+  sleep infinity
+fi
+
 if [[ -z "${POD_AUTH_TOKEN:-}" ]]; then
-  echo "ERROR: POD_AUTH_TOKEN must be set"; exit 2
+  echo "ERROR: POD_AUTH_TOKEN must be set"; sleep infinity
 fi
 if [[ -z "${HF_TOKEN:-}" ]]; then
-  echo "ERROR: HF_TOKEN must be set (needed to download Lightricks/LTX-2)"; exit 2
+  echo "ERROR: HF_TOKEN must be set (needed to download Lightricks/LTX-2)"; sleep infinity
 fi
 
 # ---------------------------------------------------------------------------
