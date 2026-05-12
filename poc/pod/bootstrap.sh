@@ -77,13 +77,23 @@ show_disk
 echo "    /workspace contents after cleanup:"
 ls -la /workspace/ 2>/dev/null | head -10 || true
 
-# Now that we've freed space, route temp/cache dirs onto the volume disk
-# (/workspace, 100+ GB) instead of the container root (/tmp on the 40 GB
-# container disk). HF's xet downloader writes large temp files via
-# _download_to_tmp_and_move during chunked downloads.
+# Now that we've freed space, route ALL temp/cache dirs onto the volume
+# disk (/workspace, 100+ GB) instead of the container root (typically a
+# 20-40 GB overlay with a tighter quota than the volume).
+#
+# HF's xet downloader is the chronic offender — it writes:
+#   1. Per-file staging at <cache_dir>/blobs/<etag>.incomplete    (HF_HOME)
+#   2. A content-addressed chunk cache for dedup                 (HF_XET_CACHE)
+#   3. Standard tempfile staging for in-flight ops                (TMPDIR)
+#   4. A persistent client config blob                           ($HOME/.cache/huggingface/xet)
+#
+# Miss any one and a 50 GB download can blow up a 20 GB overlay quota
+# halfway through. Be paranoid: point all of them at /workspace.
+export HOME="${HOME_OVERRIDE:-/workspace/home}"
 export TMPDIR="${TMPDIR:-/workspace/tmp}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/pipcache}"
-mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/workspace/.cache}"
+mkdir -p "${HOME}" "${TMPDIR}" "${PIP_CACHE_DIR}" "${XDG_CACHE_HOME}"
 
 # ---------------------------------------------------------------------------
 # 0. Sanity checks
@@ -223,16 +233,33 @@ show_disk
 log "Configuring HF cache at ${HF_HOME}"
 mkdir -p "${HF_HOME}"
 export HF_HOME
+export HF_HUB_CACHE="${HF_HOME}/hub"
 export HF_HUB_ENABLE_HF_TRANSFER=1  # faster downloads
-# xet downloads (HF's new chunked storage) write temp files via TMPDIR.
-# Already pointed at /workspace/tmp at top of script.
-export HF_XET_CACHE_DIR="${HF_HOME}/xet"
-mkdir -p "${HF_XET_CACHE_DIR}"
-python3 -m pip install --quiet hf_transfer
+# xet downloads (HF's new content-addressed chunked storage) maintain
+# their own chunk cache, controlled by HF_XET_CACHE (NOT HF_XET_CACHE_DIR
+# — that env var name is wrong and silently ignored, sending chunks back
+# to the default $HOME/.cache/huggingface/xet on the overlay).
+export HF_XET_CACHE="${HF_HOME}/xet"
+mkdir -p "${HF_HUB_CACHE}" "${HF_XET_CACHE}"
+python3 -m pip install --quiet hf_transfer hf_xet
 
 log "Pre-downloading LTX-2 (variant=${LTX2_VARIANT}) — this takes 5-15 min"
 log "Disk state before HF download"
 show_disk
+
+# LTX-2 in BF16 is ~50 GB compressed in HF's xet store, ~75 GB on disk
+# fully extracted. Xet's chunk cache adds ~50 GB of intermediate state.
+# We need >= 150 GB free on /workspace; below that, fail loud BEFORE
+# downloading half a model and then EDQUOTing.
+WS_AVAIL_GB=$(df -BG /workspace 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4+0}')
+log "Volume disk available on /workspace: ${WS_AVAIL_GB}G"
+if [[ -z "${WS_AVAIL_GB}" || "${WS_AVAIL_GB}" -lt 150 ]]; then
+  echo "[bootstrap] FATAL: /workspace has only ${WS_AVAIL_GB}G free; need >= 150G."
+  echo "[bootstrap] Likely cause: volume disk on this pod is too small."
+  echo "[bootstrap] Fix: terminate this pod, redeploy with Volume Disk = 200 GB."
+  echo "[bootstrap] Sleeping forever so logs stay readable. Container will not restart-loop."
+  sleep infinity
+fi
 python3 - <<'PYEOF'
 import os
 from huggingface_hub import snapshot_download
