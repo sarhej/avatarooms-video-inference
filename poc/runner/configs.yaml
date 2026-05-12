@@ -5,8 +5,9 @@
 # restart on the pod (~5 min).
 #
 # Strategy:
-#   1. Boot pod with distilled-fp8 → run configs A, B, C back-to-back
-#   2. Restart pod with dev          → run config D
+#   1. Boot pod with two-stage-distilled
+#   2. Run smoke first
+#   3. Then run the full baseline config
 #
 # Cost envelope (RunPod H100 80GB Community @ $1.99/hr):
 #   A (40 prompts × ~45s)            ≈ 30 min compute
@@ -20,45 +21,45 @@ configs:
   # ----------------------------------------------------------
   # A — primary baseline (must pass for GO decision)
   # ----------------------------------------------------------
-  - id: distilled_fp8_batch1
-    variant: distilled-fp8
+  - id: two_stage_distilled_batch1
+    variant: two-stage-distilled
     batch: 1
     resolution: 1080p
     aspect_ratio: "9:16"
-    note: "baseline — all 40 prompts, production target precision"
+    note: "baseline — all 40 prompts through the two-stage distilled pipeline"
     # no filter → all 40 prompts
 
   # ----------------------------------------------------------
   # B — batching at 2× (validates parallel-generation headroom)
   # ----------------------------------------------------------
-  - id: distilled_fp8_batch2
-    variant: distilled-fp8
-    batch: 2
+  - id: two_stage_distilled_batch2_disabled
+    variant: two-stage-distilled
+    batch: 1
     resolution: 1080p
     aspect_ratio: "9:16"
-    note: "batch=2 latency check — 8 prompts, 16 clips total"
+    note: "legacy batch=2 slot; forced to batch=1 because the current server is single-flight only"
     prompt_ids: [EN-1, EN-2, CINE-1, CINE-2, STYLE-3, CONV-1, CAM-2, LONG-2]
 
   # ----------------------------------------------------------
   # C — batching at 3× (production-relevant signal)
   # ----------------------------------------------------------
-  - id: distilled_fp8_batch3
-    variant: distilled-fp8
-    batch: 3
+  - id: two_stage_distilled_batch3_disabled
+    variant: two-stage-distilled
+    batch: 1
     resolution: 1080p
     aspect_ratio: "9:16"
-    note: "batch=3 latency + OOM check — 6 prompts, 18 clips total"
+    note: "legacy batch=3 slot; forced to batch=1 because the current server is single-flight only"
     prompt_ids: [EN-1, CINE-1, STYLE-3, CONV-1, CAM-2, LONG-2]
 
   # ----------------------------------------------------------
   # D — quality ceiling (dev/full BF16, slower but sharper)
   # ----------------------------------------------------------
-  - id: dev_bf16_batch1
-    variant: dev
+  - id: two_stage_distilled_quality_batch1
+    variant: two-stage-distilled
     batch: 1
     resolution: 1080p
     aspect_ratio: "9:16"
-    note: "quality ceiling — dev/full sampling, 8 representative prompts"
+    note: "quality spot-check — two-stage distilled on 8 representative prompts"
     prompt_ids: [EN-1, EN-2, CONV-1, CINE-1, CINE-5, STYLE-3, CAM-2, LONG-2]
 
   # ----------------------------------------------------------
@@ -66,7 +67,7 @@ configs:
   # before running a full config. Optional.
   # ----------------------------------------------------------
   - id: smoke
-    variant: distilled-fp8
+    variant: two-stage-distilled
     batch: 1
     resolution: 1080p
     aspect_ratio: "9:16"

@@ -45,6 +45,7 @@ import base64
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +60,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
 )
 log = logging.getLogger("ltx2-pod")
+GENERATE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +163,7 @@ class GenerateRequest(BaseModel):
     aspect_ratio: str = Field(default="9:16", pattern="^(9:16|16:9|1:1)$")
     fps: int = Field(default=24, ge=8, le=30)
     seed: int = 42
-    num_videos_per_prompt: int = Field(default=1, ge=1, le=4)
+    num_videos_per_prompt: int = Field(default=1, ge=1, le=1)
     audio_enabled: bool = True
     guidance_scale_video: float = 3.0
     guidance_scale_audio: float = 7.0
@@ -499,6 +501,11 @@ def generate(
     _require_auth(authorization)
     if STATE.pipeline is None:
         raise HTTPException(status_code=503, detail="pipeline not loaded")
+    if not GENERATE_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="generation already in progress; this pod currently supports single-flight only",
+        )
 
     cfg = VARIANT_CONFIG[STATE.variant]
     if request_body.num_videos_per_prompt != 1:
@@ -674,6 +681,7 @@ def generate(
             _set_stage(1)
         except Exception:
             pass
+        GENERATE_LOCK.release()
 
 
 if __name__ == "__main__":

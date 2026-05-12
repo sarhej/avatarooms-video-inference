@@ -20,7 +20,8 @@
 #   HF_TOKEN         HuggingFace token with read access to Lightricks/LTX-2
 #
 # Optional env vars:
-#   LTX2_VARIANT     distilled-fp8 (default) | distilled-bf16 | dev
+#   LTX2_VARIANT     two-stage-distilled (default)
+#   LTX2_BASE_OFFLOAD  1 enables model_cpu_offload on the base pipe
 #   PORT             default 8000
 
 set -euo pipefail
@@ -29,7 +30,7 @@ WORKDIR="/workspace/poc"
 REPO_URL="${REPO_URL:-https://github.com/sarhej/avatarooms-video-inference.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 HF_HOME="${HF_HOME:-/workspace/hf}"
-LTX2_VARIANT="${LTX2_VARIANT:-distilled-fp8}"
+LTX2_VARIANT="${LTX2_VARIANT:-two-stage-distilled}"
 PORT="${PORT:-8000}"
 
 log() { printf '\n[bootstrap] %s\n' "$*"; }
@@ -230,14 +231,28 @@ import os
 from huggingface_hub import snapshot_download
 
 token = os.environ["HF_TOKEN"]
-variant = os.environ.get("LTX2_VARIANT", "distilled-fp8")
+variant = os.environ.get("LTX2_VARIANT", "two-stage-distilled")
 
-# Map variant → which files we actually need. Skip the variants we
-# don't plan to load to save bandwidth/disk.
+# Map variant → which files we actually need. For the current two-stage
+# server we need the base checkpoint, scheduler/tokenizers/text encoder,
+# VAE + vocoder + connectors, the latent upsampler subfolder, and the
+# stage-2 distilled LoRA. This is intentionally broader than the old
+# single-stage warm-cache because startup now loads more components.
 allow_patterns_by_variant = {
-    "distilled-fp8":  ["*.json", "*.txt", "*distilled-fp8*", "scheduler/*", "tokenizer*/*", "text_encoder/*", "vae/*"],
-    "distilled-bf16": ["*.json", "*.txt", "*distilled-1.1*", "scheduler/*", "tokenizer*/*", "text_encoder/*", "vae/*"],
-    "dev":            ["*.json", "*.txt", "*-dev.safetensors", "scheduler/*", "tokenizer*/*", "text_encoder/*", "vae/*"],
+    "two-stage-distilled": [
+        "*.json",
+        "*.txt",
+        "*.model",
+        "scheduler/*",
+        "tokenizer*/*",
+        "text_encoder/*",
+        "vae/*",
+        "vocoder/*",
+        "connectors/*",
+        "latent_upsampler/*",
+        "*-dev.safetensors",
+        "*distilled-lora-384*",
+    ],
 }
 
 snapshot_download(

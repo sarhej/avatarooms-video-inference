@@ -75,8 +75,8 @@ sequenceDiagram
 | **Total budget** | **~$6** |
 
 > Note on disk sizes: LTX-2 with the current `allow_patterns` downloads
-> 46 files averaging ~4 GB each (≈ 184 GB total — Gemma3-12B text encoder
-> + distilled-fp8 transformer + VAE + xet temp chunks). 200 GB Volume Disk
+> the base checkpoint + text encoder + VAE + vocoder + connectors + latent
+> upsampler + distilled LoRA (plus xet temp chunks). 200 GB Volume Disk
 > gives a safe margin; 100 GB does **not** fit (verified empirically).
 
 ---
@@ -130,7 +130,7 @@ echo $POD_AUTH_TOKEN   # ← keep this, you'll paste it into the RunPod env vars
    | Field | Value |
    |---|---|
    | Container image | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (prefilled by template) |
-   | Container Start Command | `bash -lc "curl -sSL 'https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh?v=4' -o /tmp/b.sh && bash /tmp/b.sh"` |
+   | Container Start Command | `bash -lc "curl -sSL 'https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh?v=5' -o /tmp/b.sh && bash /tmp/b.sh"` |
    | Container disk | **40 GB** (apt + pip cache + system) |
    | **Volume disk** | **200 GB** ← critical, see disk-sizing note in cost section |
    | Volume mount path | `/workspace` |
@@ -145,15 +145,16 @@ echo $POD_AUTH_TOKEN   # ← keep this, you'll paste it into the RunPod env vars
    |---|---|
    | `POD_AUTH_TOKEN` | `<the secret you generated in Step 1>` |
    | `HF_TOKEN` | `<your huggingface token, hf_…>` |
-   | `LTX2_VARIANT` | `distilled-fp8` |
+   | `LTX2_VARIANT` | `two-stage-distilled` |
    | `PORT` | `8000` |
+   | `LTX2_BASE_OFFLOAD` | `0` |
 
 6. Triple-check **Volume disk = 200 GB** before clicking Deploy — RunPod has
    a habit of silently resetting that field if you tab through other inputs.
 
 7. Click **Deploy**.
 
-> The `?v=1` cache-buster in the Container Start Command sidesteps a quirk
+> The `?v=5` cache-buster in the Container Start Command sidesteps a quirk
 > where `raw.githubusercontent.com` caches responses for 5 minutes. If you
 > ever push a new bootstrap version, bump the version number (e.g. `?v=2`)
 > in the start command and restart the pod to pick it up immediately
@@ -188,16 +189,19 @@ torch 2.8.0+cu128 cuda True
 [bootstrap] Checking out repo: ...                                   (~10s)
 [bootstrap] Installing Python deps from poc/pod/requirements.txt     (~3-5 min)
 
-[bootstrap] Pre-downloading LTX-2 (variant=distilled-fp8)            (~10-20 min)
+[bootstrap] Pre-downloading LTX-2 (variant=two-stage-distilled)      (~10-20 min)
 Fetching 46 files: 100%|████████| 46/46 ...
 LTX-2 weights cached.
 
 [bootstrap] Disk state after HF download
     /dev/md0  200G  ~184G  ~16G  92% /workspace                ← tight but OK
 
-[bootstrap] Launching pod server on port 8000 (variant=distilled-fp8)
-Loading LTX-2 variant=distilled-fp8 …
-Pipeline ready in ~47s
+[bootstrap] Launching pod server on port 8000 (variant=two-stage-distilled)
+Loading LTX-2 two-stage pipeline (variant=two-stage-distilled) …
+Loading base LTX2Pipeline from Lightricks/LTX-2
+Loading stage-2 distilled LoRA (ltx-2-19b-distilled-lora-384.safetensors)
+Loading latent upsampler (subfolder=latent_upsampler)
+Pipeline ready in ~120-200s
 INFO:     Uvicorn running on http://0.0.0.0:8000
 ```
 
@@ -211,10 +215,10 @@ From your local machine:
 ```bash
 export POD_URL=https://abcdef123-8000.proxy.runpod.net
 curl -s "${POD_URL}/readyz"
-# {"status":"ready","variant":"distilled-fp8"}
+# {"status":"ready","variant":"two-stage-distilled"}
 
 curl -s -H "Authorization: Bearer $POD_AUTH_TOKEN" "${POD_URL}/info" | jq .
-# {"variant":"distilled-fp8","gpu_name":"NVIDIA H100 80GB HBM3", ...}
+# {"variant":"two-stage-distilled","gpu_name":"NVIDIA H100 80GB HBM3", ...}
 ```
 
 ### Common failure modes seen during the POC build-out
@@ -243,11 +247,11 @@ Expected output:
 
 ```
 Config:    smoke  (single-prompt smoke test)
-Variant:   distilled-fp8  batch=1  res=1080p  ar=9:16
+Variant:   two-stage-distilled  batch=1  res=1080p  ar=9:16
 Prompts:   1 selected  seed=42
 Output:    /…/runs/smoke
 Probing /readyz …
-  ready: variant=distilled-fp8
+  ready: variant=two-stage-distilled
   GPU: NVIDIA H100 80GB HBM3  81559 MB total VRAM
   Load duration: 47312 ms
 
@@ -269,16 +273,16 @@ If smoke fails — see "Troubleshooting" below.
 
 ---
 
-## Step 5 — Run the full primary config (30–35 min, ~$1.20)
+## Step 5 — Run the full primary config (longer, but correct)
 
 ```bash
-python run_pod_eval.py --config distilled_fp8_batch1
+python run_pod_eval.py --config two_stage_distilled_batch1
 ```
 
 Watch the progress bar. After ~30 min you should have:
 
 ```
-runs/distilled_fp8_batch1/
+runs/two_stage_distilled_batch1/
 ├── info.json
 ├── info_final.json
 ├── metrics.csv
@@ -293,7 +297,7 @@ Quick sanity check on the metrics:
 ```bash
 python -c "
 import csv
-rows = list(csv.DictReader(open('runs/distilled_fp8_batch1/metrics.csv')))
+rows = list(csv.DictReader(open('runs/two_stage_distilled_batch1/metrics.csv')))
 print(f'n_success: {sum(1 for r in rows if r[\"success\"]==\"true\")}')
 print(f'mean inference_ms: {sum(int(r[\"inference_ms\"]) for r in rows)/len(rows):.0f}')
 print(f'max peak_vram_mb:  {max(int(r[\"peak_vram_mb\"]) for r in rows)}')
@@ -302,40 +306,28 @@ print(f'max peak_vram_mb:  {max(int(r[\"peak_vram_mb\"]) for r in rows)}')
 
 ---
 
-## Step 6 — Batching configs (15–20 min, ~$0.80)
+## Step 6 — Single-flight note
 
-These reuse the same loaded model (no pod restart needed).
+The current server intentionally runs **single-flight only** to avoid race
+conditions between stage 1 / upsampler / stage 2 on the shared pipeline.
 
-```bash
-python run_pod_eval.py --config distilled_fp8_batch2
-python run_pod_eval.py --config distilled_fp8_batch3
+If a second request arrives while one is already running, `/generate` returns:
+
+```json
+{"detail":"generation already in progress; this pod currently supports single-flight only"}
 ```
 
-The key metric per config is the ratio:
-
-```
-inference_ms_batch_N / inference_ms_batch_1  /  N
-```
-
-If it's ≤ 1.0, batching is "free" (linear scaling). If it's 1.0–1.4,
-batching is "cheap" (we still win). If it's > 1.5, the GPU is saturated and
-batching costs more than it saves.
+That means the legacy batch=2 / batch=3 configs are disabled for now.
 
 ---
 
-## Step 7 — Quality ceiling: dev variant (35–40 min, ~$1.30)
+## Step 7 — Quality spot-check
 
-This needs a **pod restart** because the model variant changes.
-
-In the RunPod console: pod → **Restart** → before clicking it, update env vars:
-
-- Change `LTX2_VARIANT=distilled-fp8` → `LTX2_VARIANT=dev`
-
-Bootstrap will skip the apt/pip steps (cache hit) and re-download only the dev
-weights (~5 min). Wait for `/readyz` again, then:
+There is no second runtime variant at the moment. Use the representative
+8-prompt config instead:
 
 ```bash
-python run_pod_eval.py --config dev_bf16_batch1
+python run_pod_eval.py --config two_stage_distilled_quality_batch1
 ```
 
 ---
@@ -356,21 +348,18 @@ Open the clips in `runs/*` and rate them on whatever rubric you're using.
 
 | # | Criterion | How to measure |
 |---|---|---|
-| 1 | **Quality**: ≥70% of 40 distilled clips score 3/5 or above on the rubric | manual review |
-| 2 | **Quality ceiling**: dev/full clips show a noticeable bump over distilled (≥1 point per rubric) | side-by-side review |
-| 3 | **Distilled latency**: median `inference_ms` ≤ 60 000 ms for 1080p/10s | `metrics.csv` |
-| 4 | **Batch=2 efficiency**: `(batch2_ms / batch1_ms) / 2` ≤ 1.0 (linear or better) | math |
-| 5 | **Batch=3 fits**: peak VRAM at batch=3 < 78 GB (no OOM) | `metrics.csv` |
-| 6 | **Reliability**: zero crashes/OOM in 80+ generations | log review |
+| 1 | **Quality**: ≥70% of 40 clips score 3/5 or above on the rubric | manual review |
+| 2 | **Latency**: median `inference_ms` acceptable for your product target | `metrics.csv` |
+| 3 | **Reliability**: zero crashes/OOM in the baseline + quality spot-check runs | log review |
+| 4 | **Audio sync**: speech/audio is consistently present and roughly aligned | manual review |
 
 **NO-GO triggers** (any one is enough to walk away):
 
 - LTX-2 quality clearly below the corresponding hosted-API version of LTX-2
   (would indicate distilled+self-host has a quality cliff vs cloud)
-- Batch=2 inference scales worse than 1.5× (means batching doesn't recover
-  the H100's hourly cost)
-- OOM at batch=3 *and* batch=2 efficiency is poor (no path to
-  cost-competitive throughput)
+- Two-stage runtime is too slow for the user experience you need
+- Repeated 409 "generation already in progress" means we need queueing or
+  pod-level sharding before this is viable
 - Cold-start > 5 min for the pipeline alone (production unacceptable without
   a weight-cache warmer)
 
@@ -386,7 +375,7 @@ cd /workspace
 git clone --depth=1 https://github.com/sarhej/avatarooms-video-inference.git poc
 export POD_AUTH_TOKEN=...
 export HF_TOKEN=...
-export LTX2_VARIANT=distilled-fp8
+export LTX2_VARIANT=two-stage-distilled
 export PORT=8000
 bash poc/poc/pod/bootstrap.sh
 ```
@@ -406,10 +395,9 @@ wipes partial state from any prior failed runs, and continues.)
 | Bootstrap fails at `LTX2Pipeline` import on a torch≥2.7 pod | diffusers pinned version (0.36.0) predates the FP8 schema fix | edit `poc/pod/requirements.txt`, swap the pinned diffusers for `diffusers @ git+https://github.com/huggingface/diffusers.git@main`, re-run bootstrap |
 | Pod logs show `PIP INSTALL FAILED (exit N)` and bootstrap is sleeping forever | pip install of `diffusers @ git+main` failed (build error, network timeout, or disk full) | read the pip output above the `PIP INSTALL FAILED` banner for the real error. If it's network-related, just terminate and redeploy. If diffusers build failure, pin to a known-good commit instead of `@main`. |
 | Pod logs show a brief partial run of bootstrap, then CUDA banner + restart, looping every ~30-60 s, with no `PIP INSTALL FAILED` banner | You're on an old bootstrap.sh that filters pip output through `head -20`, causing SIGPIPE | bump the cache-buster on the Container Start Command to a fresh value (e.g. `?v=3`) and **Stop+Start** the pod to refetch bootstrap.sh |
-| `TypeError: couldn't find storage object Float8_e4m3fnStorage` during pipeline load (in `transformers/modeling_utils.py:253 local_torch_dtype`) | LTX2Pipeline was loaded with a single `torch_dtype=torch.float8_e4m3fn`, which cascades FP8 into the T5 text encoder; transformers then calls `torch.set_default_dtype(float8_e4m3fn)` which PyTorch can't honor (no FP8 storage backend) | use the fixed `server.py` (commit `7541…` or later) which passes a dict-typed `torch_dtype` keeping FP8 only on the diffusion transformer. Bump cache-buster, Stop+Start the pod — weights are cached so this only reloads in ~2 min. |
-| `RuntimeError: CUDA out of memory` at load | other process holding VRAM | `nvidia-smi`, kill stragglers, restart pod |
-| `RuntimeError: CUDA out of memory` at batch=3 | LTX-2 + text encoder + activations exceeds 80 GB | drop batch to 2, or enable `pipe.enable_model_cpu_offload()` in `server.py` |
+| `RuntimeError: CUDA out of memory` at load | base pipe + latent upsampler + stage-2 assets exceed available VRAM | set env var `LTX2_BASE_OFFLOAD=1` and restart the pod |
+| `/generate` returns 409 `generation already in progress` | the two-stage server is intentionally single-flight to avoid scheduler/LoRA races | wait for the active generation to finish, or run multiple pods if you need concurrency |
 | `/generate` returns 401 | bearer token mismatch | re-export `POD_AUTH_TOKEN` in both runner and pod |
 | Audio missing in mp4 | LTX-2 returned `None` for audio (rare on multilingual prompts) | check `metrics.csv` `has_audio` column; this is a known LTX-2 limitation for some languages |
 | Long pod startup | first-time HuggingFace cache, network slow | use a network volume next time so weights persist between rentals |
-| Clip looks corrupted (green frames, glitches) | FP8 numerical instability | drop variant to `distilled-bf16` and re-run smoke; if BF16 works, FP8 needs a Diffusers patch |
+| Pod exits immediately with `Unknown LTX2_VARIANT='distilled-fp8'` | old env var value from before the two-stage refactor | set `LTX2_VARIANT=two-stage-distilled` and restart |
