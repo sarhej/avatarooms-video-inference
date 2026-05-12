@@ -67,10 +67,17 @@ sequenceDiagram
 
 | Item | Estimate |
 |---|---|
-| RunPod H100 80 GB **Community Cloud** (~$1.99/hr) | ~$4.00 |
+| RunPod H100 80 GB (~$2.99/hr Community/Secure) | ~$6.00 over 2 hrs |
+| Container Disk 40 GB (~$0.006/hr) | ~$0.01 |
+| Volume Disk 200 GB (~$0.028/hr) | ~$0.06 |
 | Network egress (~400 MB of clip downloads) | $0 (included) |
 | HuggingFace bandwidth | $0 (free) |
-| **Total budget** | **~$5** |
+| **Total budget** | **~$6** |
+
+> Note on disk sizes: LTX-2 with the current `allow_patterns` downloads
+> 46 files averaging ~4 GB each (≈ 184 GB total — Gemma3-12B text encoder
+> + distilled-fp8 transformer + VAE + xet temp chunks). 200 GB Volume Disk
+> gives a safe margin; 100 GB does **not** fit (verified empirically).
 
 ---
 
@@ -103,46 +110,90 @@ echo $POD_AUTH_TOKEN   # ← keep this, you'll paste it into the RunPod env vars
 ## Step 2 — Rent the pod (5 min, billing starts)
 
 1. Go to https://www.runpod.io/console/deploy
-2. Choose **GPU type**: `H100 SXM` or `H100 PCIe`, **80 GB VRAM**, **Community Cloud**
-3. Template: any **PyTorch ≥ 2.7 / CUDA ≥ 12.7** image
-   (e.g. `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`)
-4. **Container Disk**: 40 GB minimum (pip cache + system)
-5. **Volume Disk**: 100 GB (LTX-2 weights are ~50 GB)
-6. **Expose HTTP Ports**: `8000`
-7. **Environment variables** — paste these:
-   ```
-   POD_AUTH_TOKEN=<the secret from Step 1>
-   HF_TOKEN=<your huggingface token>
-   LTX2_VARIANT=distilled-fp8
-   PORT=8000
-   ```
-8. **Container Start Command** — paste this exactly:
-   ```
-   bash -lc "curl -sSL https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh -o /tmp/b.sh && bash /tmp/b.sh"
-   ```
-9. Click **Deploy**.
+2. **GPU type**: `H100 SXM` 80 GB VRAM (Community or Secure Cloud)
+3. **Template**: click **Official** filter → pick **"Runpod Pytorch 2.8.0"**
+   - Image tag: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
+   - Provides Python 3.12, torch 2.8.0+cu128, CUDA 12.8.1, Ubuntu 24.04
+4. Open the **Pod template overrides** dialog and set exactly:
 
-> If you don't want to rely on the GitHub raw URL, you can use the Web
-> Terminal after the pod boots and run the bootstrap manually. See the
-> "manual mode" section at the bottom.
+   | Field | Value |
+   |---|---|
+   | Container image | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (prefilled by template) |
+   | Container Start Command | `bash -lc "curl -sSL 'https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh?v=1' -o /tmp/b.sh && bash /tmp/b.sh"` |
+   | Container disk | **40 GB** (apt + pip cache + system) |
+   | **Volume disk** | **200 GB** ← critical, see disk-sizing note in cost section |
+   | Volume mount path | `/workspace` |
+   | Expose HTTP ports | `8000` |
+   | Expose TCP ports | `22` (harmless, unused; auto-prefilled by template) |
+   | Start Jupyter notebook | unchecked |
+   | SSH terminal access | unchecked (no SSH key needed) |
+
+5. **Environment variables** (expand the env vars panel and add all four):
+
+   | Key | Value |
+   |---|---|
+   | `POD_AUTH_TOKEN` | `<the secret you generated in Step 1>` |
+   | `HF_TOKEN` | `<your huggingface token, hf_…>` |
+   | `LTX2_VARIANT` | `distilled-fp8` |
+   | `PORT` | `8000` |
+
+6. Triple-check **Volume disk = 200 GB** before clicking Deploy — RunPod has
+   a habit of silently resetting that field if you tab through other inputs.
+
+7. Click **Deploy**.
+
+> The `?v=1` cache-buster in the Container Start Command sidesteps a quirk
+> where `raw.githubusercontent.com` caches responses for 5 minutes. If you
+> ever push a new bootstrap version, bump the version number (e.g. `?v=2`)
+> in the start command and restart the pod to pick it up immediately
+> instead of waiting for the cache.
+
+> Web Terminal access: once the pod is running, click **Connect → Web Terminal**
+> in the pod's page. It's automatic in current RunPod UI — there's no
+> deploy-time toggle for it.
 
 ---
 
-## Step 3 — Wait for the pod to come up (10–15 min)
+## Step 3 — Wait for the pod to come up (20–25 min)
 
-In the RunPod console, click your pod → **Logs**. You'll see, in order:
+In the RunPod console, click your pod → **Logs**. You'll see these stages
+in order:
 
-1. `nvidia-smi` showing the H100
-2. `apt-get install ffmpeg`
-3. `pip install -r poc/pod/requirements.txt`
-4. `Pre-downloading LTX-2` — this is the long step (5–15 min depending on HF bandwidth)
-5. `Loading LTX-2 variant=distilled-fp8 …`
-6. `Pipeline ready in 47.3s`
-7. `Uvicorn running on http://0.0.0.0:8000`
+```
+== CUDA == ... (1× container banner)
 
-Once you see step 7, click **Connect** → **HTTP Service [Port 8000]** and copy
-the URL. It looks like `https://abcdef123-8000.proxy.runpod.net`. **That's
-your `POD_URL`.**
+[bootstrap] Pre-cleanup disk state
+[bootstrap] Inventory of /workspace BEFORE cleanup:           ← v3 diagnostic
+[bootstrap] No sentinel — AGGRESSIVE cleanup: wiping ALL ...
+[bootstrap] Post-cleanup disk state
+    /dev/md0  200G  296K  200G   1% /workspace                ← clean start
+
+[bootstrap] Sanity check: GPU + Python versions
+NVIDIA H100 80GB HBM3, 81559 MiB
+Python 3.12.3
+torch 2.8.0+cu128 cuda True
+
+[bootstrap] Installing system packages (ffmpeg, git, build tools)    (~1-2 min)
+[bootstrap] Checking out repo: ...                                   (~10s)
+[bootstrap] Installing Python deps from poc/pod/requirements.txt     (~3-5 min)
+
+[bootstrap] Pre-downloading LTX-2 (variant=distilled-fp8)            (~10-20 min)
+Fetching 46 files: 100%|████████| 46/46 ...
+LTX-2 weights cached.
+
+[bootstrap] Disk state after HF download
+    /dev/md0  200G  ~184G  ~16G  92% /workspace                ← tight but OK
+
+[bootstrap] Launching pod server on port 8000 (variant=distilled-fp8)
+Loading LTX-2 variant=distilled-fp8 …
+Pipeline ready in ~47s
+INFO:     Uvicorn running on http://0.0.0.0:8000
+```
+
+Once you see `Uvicorn running on http://0.0.0.0:8000`, the pod is ready.
+
+Click **Connect** → **HTTP Service [Port 8000]** and copy the URL — it
+looks like `https://abcdef123-8000.proxy.runpod.net`. **That's your `POD_URL`.**
 
 From your local machine:
 
@@ -154,6 +205,15 @@ curl -s "${POD_URL}/readyz"
 curl -s -H "Authorization: Bearer $POD_AUTH_TOKEN" "${POD_URL}/info" | jq .
 # {"variant":"distilled-fp8","gpu_name":"NVIDIA H100 80GB HBM3", ...}
 ```
+
+### Common failure modes seen during the POC build-out
+
+| Symptom in logs | Cause | Fix |
+|---|---|---|
+| `/tmp/b.sh: line 1: 404:: command not found` | bootstrap.sh URL returns 404 (private repo or wrong path) | repo must be **public**; verify with `curl -I <raw url>` returns HTTP 200 |
+| `ERROR: POD_AUTH_TOKEN must be set` / `ERROR: HF_TOKEN must be set` | env var missing or RunPod silently dropped it on save | edit pod settings, add the missing var, restart |
+| `OSError: No space left on device` during HF download | Volume Disk too small for LTX-2 (model is ~184 GB) | redeploy with **Volume Disk = 200 GB** |
+| Bootstrap stuck on old script even after push | `raw.githubusercontent.com` 5-min cache | bump the `?v=N` cache-buster in the start command and restart |
 
 ---
 
@@ -305,24 +365,27 @@ Open the clips in `runs/*` and rate them on whatever rubric you're using.
 
 ---
 
-## Manual mode (if the GitHub raw URL is blocked)
+## Manual mode (bypass the Container Start Command)
 
-After the pod boots, click **Connect → Web Terminal** and run:
+After the pod boots into a usable state, click **Connect → Web Terminal**
+and run:
 
 ```bash
 cd /workspace
-git clone --depth=1 https://github.com/sarhej/avatarooms-video-inference.git
+git clone --depth=1 https://github.com/sarhej/avatarooms-video-inference.git poc
 export POD_AUTH_TOKEN=...
 export HF_TOKEN=...
 export LTX2_VARIANT=distilled-fp8
-bash avatarooms-video-inference/poc/pod/bootstrap.sh
+export PORT=8000
+bash poc/poc/pod/bootstrap.sh
 ```
 
-(The bootstrap detects an existing clone and refreshes it, then continues.)
+(The bootstrap is idempotent — it detects existing clones, refreshes them,
+wipes partial state from any prior failed runs, and continues.)
 
 ---
 
-## Troubleshooting
+## Troubleshooting (during inference, after the pod is running)
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
