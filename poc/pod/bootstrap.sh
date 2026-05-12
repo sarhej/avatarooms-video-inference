@@ -40,23 +40,26 @@ show_disk() {
 echo "[bootstrap] Pre-cleanup disk state"
 show_disk
 
-echo "[bootstrap] Removing partial state from prior failed runs (must run before any mkdir on /workspace)"
-rm -f /workspace/poc/.git/shallow.lock /workspace/poc/.git/index.lock 2>/dev/null || true
-if [[ -d /workspace/hf ]] && [[ ! -f /workspace/hf/.complete ]]; then
-  echo "    /workspace/hf exists but no .complete sentinel — wiping partial download"
-  rm -rf /workspace/hf 2>/dev/null || true
-fi
-if [[ -d /workspace/tmp ]]; then
-  echo "    wiping /workspace/tmp"
-  rm -rf /workspace/tmp 2>/dev/null || true
-fi
-if [[ -d /workspace/pipcache ]]; then
-  echo "    wiping /workspace/pipcache"
-  rm -rf /workspace/pipcache 2>/dev/null || true
+echo "[bootstrap] Inventory of /workspace BEFORE cleanup:"
+ls -la /workspace/ 2>/dev/null | head -50 || true
+echo "    sizes (top 20):"
+du -sh /workspace/* /workspace/.[!.]* 2>/dev/null | sort -h | tail -20 || true
+
+# AGGRESSIVE cleanup. Targeted cleanup in v2 didn't work because the 100 GB
+# wasn't under /workspace/hf — it was somewhere else we didn't enumerate.
+# Wipe EVERYTHING under /workspace except lost+found, unless we have a
+# sentinel proving a previous bootstrap completed successfully.
+if [[ -f /workspace/.bootstrap-complete ]]; then
+  echo "[bootstrap] /workspace/.bootstrap-complete sentinel found — preserving cache"
+else
+  echo "[bootstrap] No sentinel — AGGRESSIVE cleanup: wiping ALL of /workspace contents (except lost+found)"
+  find /workspace -mindepth 1 -maxdepth 1 ! -name 'lost+found' -exec rm -rf {} + 2>/dev/null || true
 fi
 
 echo "[bootstrap] Post-cleanup disk state"
 show_disk
+echo "    /workspace contents after cleanup:"
+ls -la /workspace/ 2>/dev/null | head -10 || true
 
 # Now that we've freed space, route temp/cache dirs onto the volume disk
 # (/workspace, 100+ GB) instead of the container root (/tmp on the 40 GB
@@ -167,8 +170,10 @@ snapshot_download(
 print("LTX-2 weights cached.")
 PYEOF
 
-# Mark HF cache as complete so the next bootstrap restart skips wipe.
-touch /workspace/hf/.complete
+# Mark bootstrap as complete so the next restart preserves the cache
+# instead of wiping it. This sentinel is at /workspace/.bootstrap-complete
+# (not under /workspace/hf) so it survives if HF cache layout changes.
+touch /workspace/.bootstrap-complete
 log "Disk state after HF download"
 show_disk
 
