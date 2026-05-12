@@ -1,0 +1,74 @@
+# LTX-2 POC eval matrix.
+#
+# Each entry = one "run". The pod must be running the matching LTX2_VARIANT
+# (set in bootstrap.sh) for that run; switching variants requires a server
+# restart on the pod (~5 min).
+#
+# Strategy:
+#   1. Boot pod with distilled-fp8 → run configs A, B, C back-to-back
+#   2. Restart pod with dev          → run config D
+#
+# Cost envelope (RunPod H100 80GB Community @ $1.99/hr):
+#   A (40 prompts × ~45s)            ≈ 30 min compute
+#   B (8 prompts × ~70s, batch=2)    ≈ 10 min compute, produces 16 clips
+#   C (6 prompts × ~95s, batch=3)    ≈ 10 min compute, produces 18 clips
+#   D (8 prompts × ~4min, dev BF16)  ≈ 35 min compute
+#   Total compute ≈ 85 min + ~10 min variant-switch + ~10 min boot ≈ 1h45
+#   Total cost     ≈ $3.50
+
+configs:
+  # ----------------------------------------------------------
+  # A — primary baseline (must pass for GO decision)
+  # ----------------------------------------------------------
+  - id: distilled_fp8_batch1
+    variant: distilled-fp8
+    batch: 1
+    resolution: 1080p
+    aspect_ratio: "9:16"
+    note: "baseline — all 40 prompts, production target precision"
+    # no filter → all 40 prompts
+
+  # ----------------------------------------------------------
+  # B — batching at 2× (validates parallel-generation headroom)
+  # ----------------------------------------------------------
+  - id: distilled_fp8_batch2
+    variant: distilled-fp8
+    batch: 2
+    resolution: 1080p
+    aspect_ratio: "9:16"
+    note: "batch=2 latency check — 8 prompts, 16 clips total"
+    prompt_ids: [EN-1, EN-2, CINE-1, CINE-2, STYLE-3, CONV-1, CAM-2, LONG-2]
+
+  # ----------------------------------------------------------
+  # C — batching at 3× (production-relevant signal)
+  # ----------------------------------------------------------
+  - id: distilled_fp8_batch3
+    variant: distilled-fp8
+    batch: 3
+    resolution: 1080p
+    aspect_ratio: "9:16"
+    note: "batch=3 latency + OOM check — 6 prompts, 18 clips total"
+    prompt_ids: [EN-1, CINE-1, STYLE-3, CONV-1, CAM-2, LONG-2]
+
+  # ----------------------------------------------------------
+  # D — quality ceiling (dev/full BF16, slower but sharper)
+  # ----------------------------------------------------------
+  - id: dev_bf16_batch1
+    variant: dev
+    batch: 1
+    resolution: 1080p
+    aspect_ratio: "9:16"
+    note: "quality ceiling — dev/full sampling, 8 representative prompts"
+    prompt_ids: [EN-1, EN-2, CONV-1, CINE-1, CINE-5, STYLE-3, CAM-2, LONG-2]
+
+  # ----------------------------------------------------------
+  # SMOKE — single prompt, used to verify the pod is healthy
+  # before running a full config. Optional.
+  # ----------------------------------------------------------
+  - id: smoke
+    variant: distilled-fp8
+    batch: 1
+    resolution: 1080p
+    aspect_ratio: "9:16"
+    note: "single-prompt smoke test"
+    prompt_ids: [EN-1]

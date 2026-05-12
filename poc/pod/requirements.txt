@@ -1,0 +1,38 @@
+# LTX-2 POC pod dependencies.
+#
+# These layer on top of the RunPod "PyTorch 2.7 / CUDA 12.7" image, which
+# already provides:
+#   - python 3.10+
+#   - torch>=2.7.0 with CUDA 12.7
+#   - numpy, pillow
+#
+# Versions chosen 2026-05-12. If the pod fails to load LTX-2, the most
+# likely cause is a diffusers version that doesn't yet have the LTX2
+# pipeline integrated — pin to git main as fallback (commented below).
+
+# Diffusers with LTX-2 support (`LTX2Pipeline`)
+diffusers>=0.36.0
+# Fallback if pinned version misses LTX-2 support:
+# diffusers @ git+https://github.com/huggingface/diffusers.git@main
+
+# Transformers (text encoder: Gemma3-12B)
+transformers>=4.50.0
+accelerate>=1.5.0
+safetensors>=0.5.0
+
+# HF download + speed
+huggingface-hub>=0.27.0
+hf_transfer>=0.1.8
+
+# Audio output handling (LTX-2 returns 24 kHz stereo waveform)
+soundfile>=0.13.0
+
+# Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+python-multipart>=0.0.12
+
+# imageio is what diffusers.utils.export_to_video uses under the hood
+imageio>=2.36.0
+imageio-ffmpeg>=0.5.1

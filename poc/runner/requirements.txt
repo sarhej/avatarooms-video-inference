@@ -1,0 +1,3 @@
+# LTX-2 POC runner dependencies (runs on local machine, not on the pod).
+requests>=2.32.0
+PyYAML>=6.0.0
