@@ -166,11 +166,36 @@ log "Installing Python deps from poc/pod/requirements.txt"
 python3 -m pip install --upgrade --quiet pip
 # Force-reinstall diffusers from git main. The default pip behavior is to
 # treat any installed `diffusers` package as satisfying the `diffusers @ git+...`
-# constraint, so an old PyPI 0.36.0 wheel stays in place. --force-reinstall
-# guarantees we end up with the actual git-main commit.
+# constraint, so an old PyPI 0.36.0 wheel stays in place. The explicit
+# uninstall guarantees we end up with the actual git-main commit.
 log "Force-reinstalling diffusers from git main"
-python3 -m pip uninstall -y diffusers 2>&1 | tail -2 || true
-python3 -m pip install -r poc/pod/requirements.txt 2>&1 | grep -E "(Successfully installed|already satisfied|ERROR|Collecting diffusers|Building wheel)" | head -20
+python3 -m pip uninstall -y diffusers >/dev/null 2>&1 || true
+
+# DO NOT pipe pip's output through grep|head — when head exits after N lines,
+# pip gets SIGPIPE mid-install and (under `set -o pipefail`) the whole script
+# dies, which makes RunPod restart-loop the container. Let pip stream to
+# stdout directly, capture its exit code, and halt with `sleep infinity` on
+# failure so the operator can read the error.
+log "Running pip install (streaming, may take 3-8 min for diffusers git build)"
+set +e
+python3 -m pip install -r poc/pod/requirements.txt
+PIP_RC=$?
+set -e
+log "pip install exit code: ${PIP_RC}"
+if [[ ${PIP_RC} -ne 0 ]]; then
+  echo ""
+  echo "=================================================================="
+  echo "  PIP INSTALL FAILED (exit ${PIP_RC})"
+  echo "=================================================================="
+  echo "  See pip output above for the actual error. Common causes:"
+  echo "    - diffusers git build failure (check torch/python compat)"
+  echo "    - network timeout cloning huggingface/diffusers"
+  echo "    - disk full (check df -h above)"
+  echo ""
+  echo "  Sleeping forever to prevent restart-loop money burn."
+  echo "=================================================================="
+  sleep infinity
+fi
 
 log "Installed versions (diffusers / torch / transformers / accelerate)"
 python3 -m pip show diffusers torch transformers accelerate 2>/dev/null | \

@@ -130,7 +130,7 @@ echo $POD_AUTH_TOKEN   # ← keep this, you'll paste it into the RunPod env vars
    | Field | Value |
    |---|---|
    | Container image | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (prefilled by template) |
-   | Container Start Command | `bash -lc "curl -sSL 'https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh?v=1' -o /tmp/b.sh && bash /tmp/b.sh"` |
+   | Container Start Command | `bash -lc "curl -sSL 'https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh?v=3' -o /tmp/b.sh && bash /tmp/b.sh"` |
    | Container disk | **40 GB** (apt + pip cache + system) |
    | **Volume disk** | **200 GB** ← critical, see disk-sizing note in cost section |
    | Volume mount path | `/workspace` |
@@ -404,6 +404,8 @@ wipes partial state from any prior failed runs, and continues.)
 | Pod logs show the CUDA banner + `Python 3.11` / `torch 2.4.x` repeated dozens of times every ~30 s | Same as above — wrong template causing diffusers to fail to build from source, container exits, RunPod auto-restarts | **Terminate immediately** (every restart cycle costs money), then redeploy with the correct template |
 | `infer_schema(func): Parameter input has unsupported type torch.Tensor` when loading LTX2Pipeline | torch < 2.7 cannot resolve string forward references in diffusers' FP8 grouped-matmul custom op | Same as the wrong-template row — you need torch ≥ 2.7. Terminate and redeploy. |
 | Bootstrap fails at `LTX2Pipeline` import on a torch≥2.7 pod | diffusers pinned version (0.36.0) predates the FP8 schema fix | edit `poc/pod/requirements.txt`, swap the pinned diffusers for `diffusers @ git+https://github.com/huggingface/diffusers.git@main`, re-run bootstrap |
+| Pod logs show `PIP INSTALL FAILED (exit N)` and bootstrap is sleeping forever | pip install of `diffusers @ git+main` failed (build error, network timeout, or disk full) | read the pip output above the `PIP INSTALL FAILED` banner for the real error. If it's network-related, just terminate and redeploy. If diffusers build failure, pin to a known-good commit instead of `@main`. |
+| Pod logs show a brief partial run of bootstrap, then CUDA banner + restart, looping every ~30-60 s, with no `PIP INSTALL FAILED` banner | You're on an old bootstrap.sh that filters pip output through `head -20`, causing SIGPIPE | bump the cache-buster on the Container Start Command to a fresh value (e.g. `?v=3`) and **Stop+Start** the pod to refetch bootstrap.sh |
 | `RuntimeError: CUDA out of memory` at load | other process holding VRAM | `nvidia-smi`, kill stragglers, restart pod |
 | `RuntimeError: CUDA out of memory` at batch=3 | LTX-2 + text encoder + activations exceeds 80 GB | drop batch to 2, or enable `pipe.enable_model_cpu_offload()` in `server.py` |
 | `/generate` returns 401 | bearer token mismatch | re-export `POD_AUTH_TOKEN` in both runner and pod |
