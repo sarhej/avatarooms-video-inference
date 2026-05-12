@@ -17,26 +17,44 @@ model card and diffusers LTX2Pipeline docs:
            Output: video frames (np) + audio tensor.
 
 NOT FOR PRODUCTION USE. No persistent storage, no auth beyond a static
-bearer token, no queue, no retry. The runner machine drives load and
-captures all metrics.
+bearer token, no retry, no observability beyond /info counters. The
+runner machine drives load and captures all metrics.
 
 Endpoints
 ---------
-GET  /healthz   always 200 (liveness)
-GET  /readyz    200 once both pipes are loaded, else 503
-GET  /info      variant, dtype, peak VRAM, throughput + per-stage counters
-POST /generate  text-to-video (two-stage), single video per request
+GET    /healthz             always 200 (liveness)
+GET    /readyz              200 once both pipes are loaded, else 503
+GET    /info                variant, dtype, peak VRAM, counters, job stats
+POST   /generate            SYNC text-to-video, single video, base64-encoded
+                            response. Subject to upstream proxy timeouts
+                            (Cloudflare in front of RunPod = ~120s ceiling).
+                            Use this only for short clips (≤ 8s @ 720p).
+
+POST   /jobs                ASYNC text-to-video. Returns 202 + job_id
+                            immediately; the model runs in a background
+                            worker thread. Survives proxy timeouts since
+                            the client polls, never waits.
+GET    /jobs/{job_id}       Job status JSON (no bytes).
+GET    /jobs/{job_id}/video Raw MP4 bytes (Content-Type: video/mp4).
+                            Returns 202 if not done yet, 500 if failed,
+                            404 if expired/unknown.
+DELETE /jobs/{job_id}       Drop job from registry (frees memory).
 
 Environment
 -----------
-POD_AUTH_TOKEN     required, shared secret with the runner
-LTX2_VARIANT       only "two-stage-distilled" is supported in this build
-LTX2_REVISION      optional HF revision/tag (default main)
-LTX2_BASE_OFFLOAD  "1" enables model_cpu_offload on the base pipe (saves
-                   VRAM on smaller GPUs; on 80 GB H100 leave off for speed)
-HF_HOME            HF cache dir (default /workspace/hf)
-HF_TOKEN           optional HF token for gated weights
-PORT               default 8000
+POD_AUTH_TOKEN              required, shared secret with the runner
+LTX2_VARIANT                only "two-stage-distilled" is supported
+LTX2_REVISION               optional HF revision/tag (default main)
+LTX2_BASE_OFFLOAD           "1" enables model_cpu_offload on the base pipe
+                            (saves VRAM on smaller GPUs; on 80 GB H100
+                            leave off for speed)
+LTX2_JOB_TTL_SECONDS        how long completed jobs are retained in
+                            memory (default 600 = 10 min)
+LTX2_JOB_REGISTRY_MAX_SIZE  hard cap on number of jobs in memory
+                            (default 50; oldest terminal jobs evicted)
+HF_HOME                     HF cache dir (default /workspace/hf)
+HF_TOKEN                    optional HF token for gated weights
+PORT                        default 8000
 """
 
 from __future__ import annotations
@@ -47,12 +65,14 @@ import os
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock, Thread
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 logging.basicConfig(
@@ -60,6 +80,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
 )
 log = logging.getLogger("ltx2-pod")
+
+# Serializes GPU work. Both the sync /generate endpoint and the async
+# /jobs worker thread acquire this lock — never both at once, never
+# overlapping requests. Single-flight by construction.
 GENERATE_LOCK = threading.Lock()
 
 
@@ -76,6 +100,12 @@ PORT = int(os.environ.get("PORT", "8000"))
 # H100 it fits without offload (faster); on smaller GPUs offload reduces
 # VRAM at the cost of latency. The latent upsampler always uses CPU offload.
 LTX2_BASE_OFFLOAD = os.environ.get("LTX2_BASE_OFFLOAD", "0").strip() == "1"
+
+# Async job registry tunables. Completed jobs sit in RAM holding the MP4
+# bytes until either (a) TTL expires, (b) the registry hits its size cap
+# and they get evicted in age order, or (c) the client explicitly DELETEs.
+JOB_TTL_SECONDS = int(os.environ.get("LTX2_JOB_TTL_SECONDS", "600"))
+JOB_REGISTRY_MAX_SIZE = int(os.environ.get("LTX2_JOB_REGISTRY_MAX_SIZE", "50"))
 
 # Two-stage production pipeline using the Lightricks 19B base + distilled
 # LoRA + 2x latent upsampler. This is the recommended path per the official
@@ -197,11 +227,153 @@ class GenerateResponse(BaseModel):
     metrics: GenerateMetrics
 
 
+class VideoMeta(BaseModel):
+    """Video output metadata without the byte payload.
+
+    Used by the async /jobs API. Fetch the actual MP4 from
+    `GET /jobs/{id}/video` which returns raw bytes (no base64, no JSON).
+    """
+
+    index: int
+    frames: int
+    width: int
+    height: int
+    fps: int
+    has_audio: bool
+
+
+class JobCreateResponse(BaseModel):
+    job_id: str
+    state: str  # always "queued" at creation
+    status_url: str  # relative path to GET /jobs/{id}
+    video_url: str  # relative path to GET /jobs/{id}/video
+    created_at_ms: int
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    state: str  # "queued" | "running" | "done" | "failed"
+    created_at_ms: int
+    started_at_ms: int | None = None
+    completed_at_ms: int | None = None
+    metrics: GenerateMetrics | None = None
+    video: VideoMeta | None = None
+    error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Job registry (in-memory, thread-safe, TTL + size-capped)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Job:
+    job_id: str
+    request: GenerateRequest
+    state: str  # "queued" | "running" | "done" | "failed"
+    created_at_ms: int
+    started_at_ms: int | None = None
+    completed_at_ms: int | None = None
+    metrics: GenerateMetrics | None = None
+    video_meta: VideoMeta | None = None
+    video_bytes: bytes | None = None
+    error: str | None = None
+
+
+class JobRegistry:
+    """Thread-safe in-memory job store. No disk persistence — jobs die
+    with the process. Designed for POC use only.
+
+    Eviction policy:
+      - Completed jobs (done/failed) auto-expire after JOB_TTL_SECONDS
+      - When adding a new job and the registry is full, the oldest
+        terminal job is evicted to make room. Running jobs are never
+        evicted (would orphan the worker thread).
+    """
+
+    def __init__(self) -> None:
+        self._jobs: dict[str, Job] = {}
+        self._lock = RLock()
+
+    def create(self, request: GenerateRequest) -> Job:
+        with self._lock:
+            self._gc_expired()
+            self._evict_if_full()
+            job_id = uuid.uuid4().hex
+            job = Job(
+                job_id=job_id,
+                request=request,
+                state="queued",
+                created_at_ms=int(time.time() * 1000),
+            )
+            self._jobs[job_id] = job
+            return job
+
+    def get(self, job_id: str) -> Job | None:
+        with self._lock:
+            self._gc_expired()
+            return self._jobs.get(job_id)
+
+    def update(self, job_id: str, **kwargs: Any) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            for k, v in kwargs.items():
+                setattr(job, k, v)
+
+    def remove(self, job_id: str) -> bool:
+        with self._lock:
+            return self._jobs.pop(job_id, None) is not None
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            self._gc_expired()
+            by_state: dict[str, int] = {}
+            total_bytes = 0
+            for j in self._jobs.values():
+                by_state[j.state] = by_state.get(j.state, 0) + 1
+                if j.video_bytes:
+                    total_bytes += len(j.video_bytes)
+            return {
+                "count": len(self._jobs),
+                "by_state": by_state,
+                "cached_bytes": total_bytes,
+                "ttl_seconds": JOB_TTL_SECONDS,
+                "max_size": JOB_REGISTRY_MAX_SIZE,
+            }
+
+    def _gc_expired(self) -> None:
+        cutoff_ms = int(time.time() * 1000) - JOB_TTL_SECONDS * 1000
+        expired = [
+            jid
+            for jid, j in self._jobs.items()
+            if j.completed_at_ms and j.completed_at_ms < cutoff_ms
+        ]
+        for jid in expired:
+            self._jobs.pop(jid, None)
+
+    def _evict_if_full(self) -> None:
+        if len(self._jobs) < JOB_REGISTRY_MAX_SIZE:
+            return
+        terminal = sorted(
+            (j for j in self._jobs.values() if j.state in ("done", "failed")),
+            key=lambda j: j.completed_at_ms or 0,
+        )
+        for j in terminal:
+            self._jobs.pop(j.job_id, None)
+            if len(self._jobs) < JOB_REGISTRY_MAX_SIZE:
+                return
+
+
+JOBS = JobRegistry()
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="LTX-2 POC server", version="0.1.0")
+app = FastAPI(title="LTX-2 POC server", version="0.2.0")
 
 
 @app.on_event("startup")
@@ -478,66 +650,51 @@ def info() -> dict[str, Any]:
         "model_loaded_at_ms": STATE.model_loaded_at_ms,
         "load_duration_ms": STATE.load_duration_ms,
         "counters": STATE.counters,
+        "jobs": JOBS.stats(),
     }
 
 
-@app.post("/generate", response_model=GenerateResponse)
-def generate(
-    request_body: GenerateRequest,
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> GenerateResponse:
-    """Two-stage LTX-2 generation: base → upsample → distilled-LoRA stage 2.
+def _execute_generation(req: GenerateRequest) -> dict[str, Any]:
+    """Run the two-stage pipeline. Returns mp4 bytes + metadata + metrics.
 
-    The pipeline contract follows the official LTX-2 model card:
-      - Stage 1 runs at HALF the requested final resolution, 40 steps,
-        CFG 4.0, default scheduler, no LoRA. Output: latents.
-      - The latent upsampler doubles W and H spatially.
-      - Stage 2 runs at the FULL final resolution, 3 steps, CFG 1.0,
-        FlowMatchEulerDiscreteScheduler (no dynamic shifting), distilled
-        LoRA enabled, using STAGE_2_DISTILLED_SIGMA_VALUES and
-        noise_scale=sigmas[0] to renoise the upscaled latent.
+    Caller MUST hold GENERATE_LOCK. This function does NOT acquire it —
+    that's the responsibility of the HTTP handler (sync /generate) or
+    the worker thread (async /jobs).
+
+    Raises plain Exception on failure; the caller converts to HTTPException
+    (sync) or stores in the Job error field (async).
+
+    Returns dict with keys:
+      mp4_bytes  bytes        the muxed MP4
+      frames     int          number of video frames produced
+      width      int          stage-2 width (final)
+      height     int          stage-2 height (final)
+      fps        int          output framerate (== requested fps)
+      has_audio  bool         whether the MP4 has an audio track
+      metrics    GenerateMetrics
     """
-    _require_auth(authorization)
-    if STATE.pipeline is None:
-        raise HTTPException(status_code=503, detail="pipeline not loaded")
-    if not GENERATE_LOCK.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409,
-            detail="generation already in progress; this pod currently supports single-flight only",
-        )
-
     cfg = VARIANT_CONFIG[STATE.variant]
-    if request_body.num_videos_per_prompt != 1:
-        # Diffusers LTX2Pipeline supports num_videos_per_prompt > 1 in
-        # principle, but the two-stage flow is single-batch in every
-        # documented example. Reject for now to keep the pipeline path
-        # deterministic; we can revisit batching later for the eval run.
-        raise HTTPException(
-            status_code=400,
-            detail="num_videos_per_prompt > 1 is not supported by the two-stage pipeline",
-        )
 
     (stage1_w, stage1_h), (stage2_w, stage2_h) = _resolution_to_stage_dims(
-        request_body.resolution, request_body.aspect_ratio
+        req.resolution, req.aspect_ratio
     )
     # LTX-2: num_frames must be (8k + 1). Round to NEAREST valid value.
-    raw_frames = request_body.duration_seconds * request_body.fps
+    raw_frames = req.duration_seconds * req.fps
     num_frames = max(9, ((raw_frames - 1 + 4) // 8) * 8 + 1)
-    frame_rate = float(request_body.fps)
+    frame_rate = float(req.fps)
 
     log.info(
         "generate prompt=%r dur=%ds (%d frames) fr=%.1f s1=%dx%d s2=%dx%d audio=%s seed=%d",
-        request_body.prompt[:60] + ("…" if len(request_body.prompt) > 60 else ""),
-        request_body.duration_seconds,
+        req.prompt[:60] + ("…" if len(req.prompt) > 60 else ""),
+        req.duration_seconds,
         num_frames,
         frame_rate,
         stage1_w,
         stage1_h,
         stage2_w,
         stage2_h,
-        request_body.audio_enabled,
-        request_body.seed,
+        req.audio_enabled,
+        req.seed,
     )
 
     import torch
@@ -548,15 +705,15 @@ def generate(
     upsample_pipe = STATE.upsample_pipe
 
     try:
-        generator = torch.Generator(device="cuda").manual_seed(request_body.seed)
+        generator = torch.Generator(device="cuda").manual_seed(req.seed)
 
         # ----- Stage 1 -----
         _set_stage(1)
         s1_t0 = time.time()
         with torch.no_grad():
             video_latent, audio_latent = pipe(
-                prompt=request_body.prompt,
-                negative_prompt=request_body.negative_prompt or None,
+                prompt=req.prompt,
+                negative_prompt=req.negative_prompt or None,
                 width=stage1_w,
                 height=stage1_h,
                 num_frames=num_frames,
@@ -587,8 +744,8 @@ def generate(
             video, audio = pipe(
                 latents=upscaled_video_latent,
                 audio_latents=audio_latent,
-                prompt=request_body.prompt,
-                negative_prompt=request_body.negative_prompt or None,
+                prompt=req.prompt,
+                negative_prompt=req.negative_prompt or None,
                 width=stage2_w,
                 height=stage2_h,
                 num_frames=num_frames,
@@ -604,34 +761,23 @@ def generate(
         stage2_ms = int((time.time() - s2_t0) * 1000)
         inference_ms = stage1_ms + upsample_ms + stage2_ms
 
-        # video is a list of numpy arrays (frames, H, W, 3); audio is a list
-        # of torch tensors. With num_videos_per_prompt=1, take index 0.
         video_frames = video[0]
-        audio_track = audio[0] if (request_body.audio_enabled and audio is not None) else None
-        frame_count = int(video_frames.shape[0]) if hasattr(video_frames, "shape") else len(video_frames)
+        audio_track = audio[0] if (req.audio_enabled and audio is not None) else None
+        frame_count = (
+            int(video_frames.shape[0]) if hasattr(video_frames, "shape") else len(video_frames)
+        )
 
         mux_t0 = time.time()
         mp4_bytes = _encode_mp4_bytes(
             frames_np=video_frames,
             audio_tensor=audio_track,
-            fps=request_body.fps,
+            fps=req.fps,
             audio_sample_rate=STATE.audio_sample_rate,
         )
         mux_ms = int((time.time() - mux_t0) * 1000)
 
         wall_ms = int((time.time() - wall_t0) * 1000)
         peak_vram = _peak_vram_mb()
-        outputs = [
-            VideoOutput(
-                index=0,
-                data_b64=base64.b64encode(mp4_bytes).decode("ascii"),
-                frames=frame_count,
-                width=stage2_w,
-                height=stage2_h,
-                fps=request_body.fps,
-                has_audio=audio_track is not None,
-            )
-        ]
 
         STATE.counters["generations_total"] += 1
         STATE.counters["videos_produced_total"] += 1
@@ -642,46 +788,290 @@ def generate(
         STATE.counters["peak_vram_mb"] = max(STATE.counters["peak_vram_mb"], peak_vram)
 
         log.info(
-            "generate done wall=%dms s1=%dms up=%dms s2=%dms mux=%dms peak_vram=%dMB",
+            "generate done wall=%dms s1=%dms up=%dms s2=%dms mux=%dms peak_vram=%dMB bytes=%d",
             wall_ms,
             stage1_ms,
             upsample_ms,
             stage2_ms,
             mux_ms,
             peak_vram,
+            len(mp4_bytes),
         )
 
+        metrics = GenerateMetrics(
+            wall_clock_ms=wall_ms,
+            inference_ms=inference_ms,
+            decode_ms=stage2_ms,  # final decode happens inside stage 2
+            mux_ms=mux_ms,
+            peak_vram_mb=peak_vram,
+            num_inference_steps=int(cfg["stage1_steps"]) + int(cfg["stage2_steps"]),
+            batch_size=1,
+        )
+
+        return {
+            "mp4_bytes": mp4_bytes,
+            "frames": frame_count,
+            "width": stage2_w,
+            "height": stage2_h,
+            "fps": req.fps,
+            "has_audio": audio_track is not None,
+            "metrics": metrics,
+        }
+
+    finally:
+        # Always leave the pipe in stage-1 state for the next caller, even
+        # on exception, so the next request starts from a known state.
+        try:
+            _set_stage(1)
+        except Exception:
+            pass
+
+
+@app.post("/generate", response_model=GenerateResponse)
+def generate(
+    request_body: GenerateRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> GenerateResponse:
+    """SYNCHRONOUS two-stage LTX-2 generation.
+
+    The pipeline contract follows the official LTX-2 model card:
+      - Stage 1 runs at HALF the requested final resolution, 40 steps,
+        CFG 4.0, default scheduler, no LoRA. Output: latents.
+      - The latent upsampler doubles W and H spatially.
+      - Stage 2 runs at the FULL final resolution, 3 steps, CFG 1.0,
+        FlowMatchEulerDiscreteScheduler (no dynamic shifting), distilled
+        LoRA enabled, using STAGE_2_DISTILLED_SIGMA_VALUES and
+        noise_scale=sigmas[0] to renoise the upscaled latent.
+
+    WARNING: this endpoint blocks the HTTP connection for the full
+    generation. Through RunPod's Cloudflare proxy the wire timeout is
+    ~120s, so clips >= ~10s WILL hit HTTP 524 even though the pod
+    completes successfully. For long clips, use POST /jobs (async).
+    """
+    _require_auth(authorization)
+    if STATE.pipeline is None:
+        raise HTTPException(status_code=503, detail="pipeline not loaded")
+    if request_body.num_videos_per_prompt != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="num_videos_per_prompt > 1 is not supported by the two-stage pipeline",
+        )
+    if not GENERATE_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="generation already in progress; this pod is single-flight",
+        )
+    try:
+        result = _execute_generation(request_body)
         return GenerateResponse(
             variant=STATE.variant,
             dtype=STATE.dtype,
-            videos=outputs,
-            metrics=GenerateMetrics(
-                wall_clock_ms=wall_ms,
-                inference_ms=inference_ms,
-                decode_ms=stage2_ms,  # final decode happens inside stage 2
-                mux_ms=mux_ms,
-                peak_vram_mb=peak_vram,
-                num_inference_steps=int(cfg["stage1_steps"]) + int(cfg["stage2_steps"]),
-                batch_size=1,
-            ),
+            videos=[
+                VideoOutput(
+                    index=0,
+                    data_b64=base64.b64encode(result["mp4_bytes"]).decode("ascii"),
+                    frames=result["frames"],
+                    width=result["width"],
+                    height=result["height"],
+                    fps=result["fps"],
+                    has_audio=result["has_audio"],
+                )
+            ],
+            metrics=result["metrics"],
         )
-
+    except HTTPException:
+        raise
     except Exception as exc:
         STATE.counters["generations_failed"] += 1
         log.exception("generate failed: %r", exc)
-        # Best-effort: restore stage 1 settings so the next request starts clean.
-        try:
-            _set_stage(1)
-        except Exception:
-            pass
         raise HTTPException(status_code=500, detail=f"generation_failed: {exc!r}") from exc
     finally:
-        # Always leave the pipe in stage-1 state for the next caller.
-        try:
-            _set_stage(1)
-        except Exception:
-            pass
         GENERATE_LOCK.release()
+
+
+# ---------------------------------------------------------------------------
+# Async jobs API
+# ---------------------------------------------------------------------------
+
+
+def _worker_run_job(job_id: str) -> None:
+    """Worker thread body: block on GENERATE_LOCK, run the job, store result.
+
+    Multiple workers (one per submitted job) race for the same lock — the
+    OS mutex gives us FIFO-ish scheduling and single-flight by construction.
+    Workers never run concurrently with each other or with sync /generate.
+    """
+    # NOTE: this blocks (no timeout). If the pod is wedged the job sits
+    # in "queued" forever; that's acceptable for POC. Production would
+    # add a queue timeout that transitions queued → failed.
+    GENERATE_LOCK.acquire()
+    try:
+        job = JOBS.get(job_id)
+        if job is None:
+            log.warning("worker for %s: job evicted before run", job_id)
+            return
+        JOBS.update(
+            job_id,
+            state="running",
+            started_at_ms=int(time.time() * 1000),
+        )
+        try:
+            result = _execute_generation(job.request)
+            JOBS.update(
+                job_id,
+                state="done",
+                completed_at_ms=int(time.time() * 1000),
+                video_bytes=result["mp4_bytes"],
+                video_meta=VideoMeta(
+                    index=0,
+                    frames=result["frames"],
+                    width=result["width"],
+                    height=result["height"],
+                    fps=result["fps"],
+                    has_audio=result["has_audio"],
+                ),
+                metrics=result["metrics"],
+            )
+            log.info("job %s done (%d bytes)", job_id, len(result["mp4_bytes"]))
+        except Exception as exc:
+            STATE.counters["generations_failed"] += 1
+            log.exception("job %s failed: %r", job_id, exc)
+            JOBS.update(
+                job_id,
+                state="failed",
+                completed_at_ms=int(time.time() * 1000),
+                error=repr(exc),
+            )
+    finally:
+        GENERATE_LOCK.release()
+
+
+@app.post("/jobs", response_model=JobCreateResponse, status_code=202)
+def jobs_create(
+    request_body: GenerateRequest,
+    authorization: str | None = Header(default=None),
+) -> JobCreateResponse:
+    """Submit an async generation job. Returns 202 + job_id immediately.
+
+    The model runs in a background thread; poll GET /jobs/{job_id} for
+    status. Fetch the MP4 from GET /jobs/{job_id}/video once state == done.
+
+    This is the path that survives proxy timeouts — the HTTP call here
+    returns within milliseconds. Recommended for any clip >= 10s.
+    """
+    _require_auth(authorization)
+    if STATE.pipeline is None:
+        raise HTTPException(status_code=503, detail="pipeline not loaded")
+    if request_body.num_videos_per_prompt != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="num_videos_per_prompt > 1 is not supported by the two-stage pipeline",
+        )
+
+    job = JOBS.create(request_body)
+    worker = Thread(
+        target=_worker_run_job,
+        args=(job.job_id,),
+        daemon=True,
+        name=f"ltx2-job-{job.job_id[:8]}",
+    )
+    worker.start()
+    log.info(
+        "job %s queued dur=%ds res=%s ar=%s",
+        job.job_id,
+        request_body.duration_seconds,
+        request_body.resolution,
+        request_body.aspect_ratio,
+    )
+    return JobCreateResponse(
+        job_id=job.job_id,
+        state=job.state,
+        status_url=f"/jobs/{job.job_id}",
+        video_url=f"/jobs/{job.job_id}/video",
+        created_at_ms=job.created_at_ms,
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+def jobs_get(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> JobStatusResponse:
+    """Poll job status. Returns metadata only — no bytes."""
+    _require_auth(authorization)
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found or expired")
+    return JobStatusResponse(
+        job_id=job.job_id,
+        state=job.state,
+        created_at_ms=job.created_at_ms,
+        started_at_ms=job.started_at_ms,
+        completed_at_ms=job.completed_at_ms,
+        metrics=job.metrics,
+        video=job.video_meta,
+        error=job.error,
+    )
+
+
+@app.get("/jobs/{job_id}/video")
+def jobs_video(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Fetch the MP4 bytes for a completed job.
+
+    Returns raw `video/mp4` (no JSON, no base64). This is the endpoint
+    designed to stream cleanly through Cloudflare — the bytes are
+    already on disk in memory, first byte goes out within milliseconds
+    of the request hitting the pod.
+
+    Status:
+      200  - job done; body is the MP4
+      202  - job queued or running; body is JSON {state, retry_after_seconds}
+      404  - job unknown or expired
+      500  - job failed; body is JSON {state, error}
+    """
+    _require_auth(authorization)
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found or expired")
+    if job.state == "failed":
+        return JSONResponse(
+            {"state": "failed", "error": job.error or "unknown"},
+            status_code=500,
+        )
+    if job.state in ("queued", "running"):
+        return JSONResponse(
+            {"state": job.state, "retry_after_seconds": 5},
+            status_code=202,
+        )
+    # state == "done"
+    if job.video_bytes is None:
+        raise HTTPException(status_code=500, detail="job done but bytes not available")
+    return Response(
+        content=job.video_bytes,
+        media_type="video/mp4",
+        headers={"Content-Length": str(len(job.video_bytes))},
+    )
+
+
+@app.delete("/jobs/{job_id}")
+def jobs_delete(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Drop a job from the registry. Frees its cached MP4 bytes.
+
+    Note: this does NOT cancel a running job — the worker will complete
+    its work and then find an evicted slot. Worker logs the eviction.
+    """
+    _require_auth(authorization)
+    ok = JOBS.remove(job_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="job not found or expired")
+    return {"deleted": True, "job_id": job_id}
 
 
 if __name__ == "__main__":

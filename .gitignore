@@ -43,3 +43,11 @@ Thumbs.db
 # Evaluation & runtime outputs (never committed)
 runs/
 *.log
+
+# Local POC artifacts (generated videos, metrics, response dumps)
+# These can be large (MB-GB) and are reproducible from the pod.
+poc/outputs/
+*.mp4
+*.webm
+*.mkv
+*.wav
