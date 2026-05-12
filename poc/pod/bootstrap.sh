@@ -240,36 +240,51 @@ from huggingface_hub import snapshot_download
 token = os.environ["HF_TOKEN"]
 variant = os.environ.get("LTX2_VARIANT", "two-stage-distilled")
 
-# Map variant → which files we actually need. For the current two-stage
-# server we need the base checkpoint, scheduler/tokenizers/text encoder,
-# VAE + vocoder + connectors, the latent upsampler subfolder, and the
-# stage-2 distilled LoRA. This is intentionally broader than the old
-# single-stage warm-cache because startup now loads more components.
+# Map variant → which files we actually need.
+#
+# two-stage-distilled  needs everything: base checkpoint, scheduler,
+#                      tokenizers, text encoder, VAE, vocoder, connectors,
+#                      latent upsampler subfolder, and the stage-2
+#                      distilled LoRA weights.
+#
+# single-stage-dev     needs only the base pipeline components. Skips
+#                      the upsampler subfolder and the distilled LoRA
+#                      file entirely, saving ~5 GB of download + disk.
+#
+# Both variants share the same base checkpoint, so swapping between them
+# on an existing pod (with cache warm) is fast — only the first variant
+# pays the full download time.
+shared_patterns = [
+    "*.json",
+    "*.txt",
+    "*.model",
+    "scheduler/*",
+    "tokenizer*/*",
+    "text_encoder/*",
+    "vae/*",
+    "vocoder/*",
+    "connectors/*",
+    "*-dev.safetensors",  # base BF16 checkpoint
+]
 allow_patterns_by_variant = {
-    "two-stage-distilled": [
-        "*.json",
-        "*.txt",
-        "*.model",
-        "scheduler/*",
-        "tokenizer*/*",
-        "text_encoder/*",
-        "vae/*",
-        "vocoder/*",
-        "connectors/*",
+    "two-stage-distilled": shared_patterns + [
         "latent_upsampler/*",
-        "*-dev.safetensors",
         "*distilled-lora-384*",
     ],
+    "single-stage-dev": list(shared_patterns),
 }
 
+patterns = allow_patterns_by_variant.get(variant)
+if patterns is None:
+    print(f"WARNING: unknown LTX2_VARIANT={variant!r}; downloading ALL files")
 snapshot_download(
     repo_id="Lightricks/LTX-2",
     cache_dir=os.environ.get("HF_HOME", "/workspace/hf"),
     token=token,
-    allow_patterns=allow_patterns_by_variant.get(variant),
+    allow_patterns=patterns,
     max_workers=4,
 )
-print("LTX-2 weights cached.")
+print(f"LTX-2 weights cached for variant={variant!r}.")
 PYEOF
 
 # Mark bootstrap as complete so the next restart preserves the cache

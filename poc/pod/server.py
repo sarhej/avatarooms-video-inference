@@ -125,6 +125,10 @@ JOB_REGISTRY_MAX_SIZE = int(os.environ.get("LTX2_JOB_REGISTRY_MAX_SIZE", "50"))
 #     a different runtime (not diffusers).
 VARIANT_CONFIG: dict[str, dict[str, Any]] = {
     "two-stage-distilled": {
+        # Fast distilled recipe per official LTX-2 model card. Two-stage
+        # flow with distilled LoRA on stage 2. ~140s wall-clock for 10s
+        # @ 720p portrait. Quality acceptable for ambient/scene content.
+        "pipeline_mode": "two_stage_distilled",
         "model_id": "Lightricks/LTX-2",
         "lora_weight_name": "ltx-2-19b-distilled-lora-384.safetensors",
         "lora_adapter_name": "stage_2_distilled",
@@ -133,6 +137,20 @@ VARIANT_CONFIG: dict[str, dict[str, Any]] = {
         "stage1_cfg": 4.0,
         "stage2_steps": 3,
         "stage2_cfg": 1.0,
+    },
+    "single-stage-dev": {
+        # Quality-mode recipe per official LTX-2 model card. Single-stage
+        # direct generation at full target resolution, no upsampler, no
+        # LoRA. ~5-7x slower than distilled but visibly higher quality.
+        # Use this for premium tier, A/B comparisons, and any case where
+        # quality > cost. Frees ~5 GB VRAM at load (no LoRA, no upsampler).
+        "pipeline_mode": "single_stage_dev",
+        "model_id": "Lightricks/LTX-2",
+        "lora_weight_name": None,
+        "lora_adapter_name": None,
+        "dtype": "bfloat16",
+        "steps": 30,
+        "cfg": 5.0,
     },
 }
 
@@ -378,22 +396,23 @@ app = FastAPI(title="LTX-2 POC server", version="0.2.0")
 
 @app.on_event("startup")
 def _load_model_on_startup() -> None:
-    """Load the LTX-2 two-stage pipeline once at process start.
+    """Load the LTX-2 pipeline(s) once at process start.
 
-    What we load:
-      1. Base LTX2Pipeline (Lightricks/LTX-2, ~19B, BF16) — used for both
-         stage 1 (default scheduler, LoRA off) and stage 2 (alt scheduler,
-         distilled LoRA on).
-      2. The stage-2 distilled LoRA weights, loaded into the base pipe but
-         left DISABLED until stage 2.
-      3. A second `FlowMatchEulerDiscreteScheduler` configured for stage 2
-         (use_dynamic_shifting=False, shift_terminal=None).
-      4. LTX2LatentUpsamplerModel + LTX2LatentUpsamplePipeline for 2x
-         spatial upsampling between stages.
+    What gets loaded depends on cfg["pipeline_mode"]:
 
-    Loading takes ~2 min (already cached) — we want /readyz to be the
-    source of truth for "is the pod hot?", so we pay this cost up front
-    instead of on the first /generate.
+      two_stage_distilled (LTX2_VARIANT=two-stage-distilled):
+        1. Base LTX2Pipeline (Lightricks/LTX-2, ~19B, BF16)
+        2. Distilled stage-2 LoRA weights (~1 GB), loaded but DISABLED
+        3. FlowMatchEulerDiscreteScheduler for stage 2 (dynamic shift off)
+        4. LTX2LatentUpsamplerModel + LTX2LatentUpsamplePipeline
+
+      single_stage_dev (LTX2_VARIANT=single-stage-dev):
+        1. Base LTX2Pipeline only
+        Skips LoRA + upsampler entirely (~5 GB VRAM saved at load).
+
+    Loading takes ~100-180s (already cached weights) — we want /readyz to
+    be the source of truth for "is the pod hot?", so we pay this cost up
+    front instead of on the first /generate.
     """
     if not POD_AUTH_TOKEN:
         log.warning("POD_AUTH_TOKEN not set — server will reject all generate calls")
@@ -402,15 +421,16 @@ def _load_model_on_startup() -> None:
     if cfg is None:
         log.error("Unknown LTX2_VARIANT=%r. Valid: %s", LTX2_VARIANT, list(VARIANT_CONFIG))
         sys.exit(2)
+    pipeline_mode = cfg["pipeline_mode"]
+    if pipeline_mode not in ("two_stage_distilled", "single_stage_dev"):
+        log.error("Unknown pipeline_mode=%r for variant=%r", pipeline_mode, LTX2_VARIANT)
+        sys.exit(2)
 
-    log.info("Loading LTX-2 two-stage pipeline (variant=%s) …", LTX2_VARIANT)
+    log.info("Loading LTX-2 pipeline (variant=%s, mode=%s) …", LTX2_VARIANT, pipeline_mode)
     t0 = time.time()
 
     import torch
-    from diffusers import FlowMatchEulerDiscreteScheduler, LTX2Pipeline
-    from diffusers.pipelines.ltx2 import LTX2LatentUpsamplePipeline
-    from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
-    from diffusers.pipelines.ltx2.utils import STAGE_2_DISTILLED_SIGMA_VALUES
+    from diffusers import LTX2Pipeline
 
     STATE.gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no-cuda"
     STATE.gpu_total_vram_mb = (
@@ -422,7 +442,7 @@ def _load_model_on_startup() -> None:
 
     torch_dtype = torch.bfloat16
 
-    # ---------- 1. Base pipeline ----------
+    # ---------- 1. Base pipeline (always loaded) ----------
     log.info("Loading base LTX2Pipeline from %s", cfg["model_id"])
     pipe = LTX2Pipeline.from_pretrained(
         cfg["model_id"],
@@ -438,45 +458,65 @@ def _load_model_on_startup() -> None:
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
 
-    # ---------- 2. Distilled stage-2 LoRA ----------
-    log.info("Loading stage-2 distilled LoRA (%s)", cfg["lora_weight_name"])
-    pipe.load_lora_weights(
-        cfg["model_id"],
-        adapter_name=cfg["lora_adapter_name"],
-        weight_name=cfg["lora_weight_name"],
-    )
-    # Start DISABLED — stage 1 must run on the base weights only.
-    pipe.set_adapters([cfg["lora_adapter_name"]], [0.0])
+    # ---------- 2. Stage-2 distilled LoRA (only for two-stage-distilled) ----------
+    if cfg.get("lora_weight_name"):
+        log.info("Loading stage-2 distilled LoRA (%s)", cfg["lora_weight_name"])
+        pipe.load_lora_weights(
+            cfg["model_id"],
+            adapter_name=cfg["lora_adapter_name"],
+            weight_name=cfg["lora_weight_name"],
+        )
+        # Start DISABLED — stage 1 must run on the base weights only.
+        pipe.set_adapters([cfg["lora_adapter_name"]], [0.0])
+        STATE.lora_adapter_name = cfg["lora_adapter_name"]
+    else:
+        log.info("Skipping LoRA load (variant has no LoRA)")
+        STATE.lora_adapter_name = ""
 
     # ---------- 3. Schedulers ----------
-    # Stage 1 keeps the default scheduler the pipe was built with.
+    # Stage 1 keeps the default scheduler the pipe was built with. For
+    # single-stage dev, this is the only scheduler we ever use.
     STATE.stage1_scheduler = pipe.scheduler
-    # Stage 2 needs a FlowMatchEulerDiscreteScheduler with the docs' specific
-    # config (dynamic shifting off, no shift terminal). Build it now so we
-    # don't pay reconfiguration cost on every request.
-    STATE.stage2_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        pipe.scheduler.config,
-        use_dynamic_shifting=False,
-        shift_terminal=None,
-    )
-    STATE.stage_2_sigmas = list(STAGE_2_DISTILLED_SIGMA_VALUES)
+    if pipeline_mode == "two_stage_distilled":
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        from diffusers.pipelines.ltx2.utils import STAGE_2_DISTILLED_SIGMA_VALUES
 
-    # ---------- 4. Latent upsampler ----------
-    log.info("Loading latent upsampler (subfolder=latent_upsampler)")
-    latent_upsampler = LTX2LatentUpsamplerModel.from_pretrained(
-        cfg["model_id"],
-        subfolder="latent_upsampler",
-        torch_dtype=torch_dtype,
-        cache_dir=HF_HOME,
-    )
-    upsample_pipe = LTX2LatentUpsamplePipeline(
-        vae=pipe.vae,
-        latent_upsampler=latent_upsampler,
-    )
-    # Upsampler always uses CPU offload — it's only needed between stage 1
-    # and stage 2, never concurrent with either; offload saves VRAM during
-    # the big stages.
-    upsample_pipe.enable_model_cpu_offload(device="cuda")
+        # Stage 2 needs a FlowMatchEulerDiscreteScheduler with the docs'
+        # specific config (dynamic shifting off, no shift terminal).
+        STATE.stage2_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            pipe.scheduler.config,
+            use_dynamic_shifting=False,
+            shift_terminal=None,
+        )
+        STATE.stage_2_sigmas = list(STAGE_2_DISTILLED_SIGMA_VALUES)
+    else:
+        STATE.stage2_scheduler = None
+        STATE.stage_2_sigmas = []
+
+    # ---------- 4. Latent upsampler (only for two-stage-distilled) ----------
+    if pipeline_mode == "two_stage_distilled":
+        from diffusers.pipelines.ltx2 import LTX2LatentUpsamplePipeline
+        from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+
+        log.info("Loading latent upsampler (subfolder=latent_upsampler)")
+        latent_upsampler = LTX2LatentUpsamplerModel.from_pretrained(
+            cfg["model_id"],
+            subfolder="latent_upsampler",
+            torch_dtype=torch_dtype,
+            cache_dir=HF_HOME,
+        )
+        upsample_pipe = LTX2LatentUpsamplePipeline(
+            vae=pipe.vae,
+            latent_upsampler=latent_upsampler,
+        )
+        # Upsampler always uses CPU offload — it's only needed between
+        # stages, never concurrent with either; offload saves VRAM during
+        # the big stages.
+        upsample_pipe.enable_model_cpu_offload(device="cuda")
+        STATE.upsample_pipe = upsample_pipe
+    else:
+        log.info("Skipping latent upsampler load (single-stage variant)")
+        STATE.upsample_pipe = None
 
     # ---------- 5. Audio sample rate ----------
     try:
@@ -486,8 +526,6 @@ def _load_model_on_startup() -> None:
         STATE.audio_sample_rate = 24000
 
     STATE.pipeline = pipe
-    STATE.upsample_pipe = upsample_pipe
-    STATE.lora_adapter_name = cfg["lora_adapter_name"]
     STATE.variant = LTX2_VARIANT
     STATE.dtype = "bfloat16"
     STATE.load_duration_ms = int((time.time() - t0) * 1000)
@@ -608,7 +646,14 @@ def _encode_mp4_bytes(
 def _set_stage(stage: int) -> None:
     """Configure the base pipe for stage 1 (LoRA off, default sched) or
     stage 2 (LoRA on, FlowMatchEuler variant). Idempotent across requests.
+
+    For single-stage variants (no LoRA, no alternate scheduler), this is
+    a safe no-op. Caller can always invoke it.
     """
+    cfg = VARIANT_CONFIG[STATE.variant]
+    if cfg["pipeline_mode"] != "two_stage_distilled":
+        # Single-stage variants: nothing to toggle.
+        return
     pipe = STATE.pipeline
     if stage == 1:
         pipe.scheduler = STATE.stage1_scheduler
@@ -655,7 +700,7 @@ def info() -> dict[str, Any]:
 
 
 def _execute_generation(req: GenerateRequest) -> dict[str, Any]:
-    """Run the two-stage pipeline. Returns mp4 bytes + metadata + metrics.
+    """Dispatch to the variant-specific generation path.
 
     Caller MUST hold GENERATE_LOCK. This function does NOT acquire it —
     that's the responsibility of the HTTP handler (sync /generate) or
@@ -667,13 +712,26 @@ def _execute_generation(req: GenerateRequest) -> dict[str, Any]:
     Returns dict with keys:
       mp4_bytes  bytes        the muxed MP4
       frames     int          number of video frames produced
-      width      int          stage-2 width (final)
-      height     int          stage-2 height (final)
+      width      int          final width
+      height     int          final height
       fps        int          output framerate (== requested fps)
       has_audio  bool         whether the MP4 has an audio track
       metrics    GenerateMetrics
     """
     cfg = VARIANT_CONFIG[STATE.variant]
+    mode = cfg["pipeline_mode"]
+    if mode == "two_stage_distilled":
+        return _execute_two_stage_distilled(req, cfg)
+    if mode == "single_stage_dev":
+        return _execute_single_stage_dev(req, cfg)
+    raise RuntimeError(f"Unsupported pipeline_mode: {mode}")
+
+
+def _execute_two_stage_distilled(
+    req: GenerateRequest,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Two-stage distilled flow: base stage1 (half res) → upsample → distilled stage2."""
 
     (stage1_w, stage1_h), (stage2_w, stage2_h) = _resolution_to_stage_dims(
         req.resolution, req.aspect_ratio
@@ -825,6 +883,129 @@ def _execute_generation(req: GenerateRequest) -> dict[str, Any]:
             _set_stage(1)
         except Exception:
             pass
+
+
+def _execute_single_stage_dev(
+    req: GenerateRequest,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Single-stage quality mode: direct generation at full target resolution.
+
+    No latent upsampler, no LoRA, no scheduler swap. The full N-step
+    denoise runs at the final resolution. ~5-7x slower than the two-stage
+    distilled flow but visibly higher quality — this is the documented
+    Lightricks "dev" / production-quality recipe.
+
+    Designed for H200/B200-class GPUs. On H100 80 GB this fits at 720p
+    portrait but with very little headroom; you'll want LTX2_BASE_OFFLOAD=1
+    for any margin.
+    """
+    # We want the FULL target resolution (no half-res stage 1 anymore).
+    # Reuse _resolution_to_stage_dims and take its stage_2 output.
+    (_, _), (full_w, full_h) = _resolution_to_stage_dims(
+        req.resolution, req.aspect_ratio
+    )
+    # LTX-2: num_frames must be (8k + 1). Round to NEAREST valid value.
+    raw_frames = req.duration_seconds * req.fps
+    num_frames = max(9, ((raw_frames - 1 + 4) // 8) * 8 + 1)
+    frame_rate = float(req.fps)
+
+    steps = int(cfg["steps"])
+    cfg_scale = float(cfg["cfg"])
+
+    log.info(
+        "generate(dev) prompt=%r dur=%ds (%d frames) fr=%.1f wxh=%dx%d steps=%d cfg=%.1f audio=%s seed=%d",
+        req.prompt[:60] + ("…" if len(req.prompt) > 60 else ""),
+        req.duration_seconds,
+        num_frames,
+        frame_rate,
+        full_w,
+        full_h,
+        steps,
+        cfg_scale,
+        req.audio_enabled,
+        req.seed,
+    )
+
+    import torch
+
+    _reset_peak_vram()
+    wall_t0 = time.time()
+    pipe = STATE.pipeline
+
+    generator = torch.Generator(device="cuda").manual_seed(req.seed)
+    inf_t0 = time.time()
+    with torch.no_grad():
+        video, audio = pipe(
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt or None,
+            width=full_w,
+            height=full_h,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=steps,
+            guidance_scale=cfg_scale,
+            generator=generator,
+            output_type="np",
+            return_dict=False,
+        )
+    inference_ms = int((time.time() - inf_t0) * 1000)
+
+    video_frames = video[0]
+    audio_track = audio[0] if (req.audio_enabled and audio is not None) else None
+    frame_count = (
+        int(video_frames.shape[0]) if hasattr(video_frames, "shape") else len(video_frames)
+    )
+
+    mux_t0 = time.time()
+    mp4_bytes = _encode_mp4_bytes(
+        frames_np=video_frames,
+        audio_tensor=audio_track,
+        fps=req.fps,
+        audio_sample_rate=STATE.audio_sample_rate,
+    )
+    mux_ms = int((time.time() - mux_t0) * 1000)
+
+    wall_ms = int((time.time() - wall_t0) * 1000)
+    peak_vram = _peak_vram_mb()
+
+    STATE.counters["generations_total"] += 1
+    STATE.counters["videos_produced_total"] += 1
+    STATE.counters["inference_seconds_total"] += inference_ms / 1000.0
+    STATE.counters["peak_vram_mb"] = max(STATE.counters["peak_vram_mb"], peak_vram)
+    # stage1/upsample/stage2 counters intentionally not updated — they
+    # don't apply to single-stage variants. /info still reports them as
+    # cumulative across the pod's lifetime regardless of variant, which
+    # is consistent.
+
+    log.info(
+        "generate(dev) done wall=%dms infer=%dms mux=%dms peak_vram=%dMB bytes=%d",
+        wall_ms,
+        inference_ms,
+        mux_ms,
+        peak_vram,
+        len(mp4_bytes),
+    )
+
+    metrics = GenerateMetrics(
+        wall_clock_ms=wall_ms,
+        inference_ms=inference_ms,
+        decode_ms=0,  # not separately measurable in single-stage
+        mux_ms=mux_ms,
+        peak_vram_mb=peak_vram,
+        num_inference_steps=steps,
+        batch_size=1,
+    )
+
+    return {
+        "mp4_bytes": mp4_bytes,
+        "frames": frame_count,
+        "width": full_w,
+        "height": full_h,
+        "fps": req.fps,
+        "has_audio": audio_track is not None,
+        "metrics": metrics,
+    }
 
 
 @app.post("/generate", response_model=GenerateResponse)
