@@ -1,28 +1,42 @@
-"""LTX-2 POC server — FastAPI wrapper around the diffusers LTX2 pipeline.
+"""LTX-2 POC server — FastAPI wrapper around the diffusers LTX2 two-stage pipeline.
 
 Single-process, single-GPU. Designed for short-lived RunPod rentals to
-evaluate LTX-2 inference performance, quality, and parallel-batching
-headroom before committing to a production self-host architecture.
+evaluate LTX-2 inference performance, quality, and headroom before
+committing to a production self-host architecture.
 
-NOT FOR PRODUCTION USE. No persistent storage, no Firestore, no auth
-beyond a static bearer token, no queue, no retry. The runner machine
-drives load and captures all metrics.
+Implements the production-quality two-stage flow per the official LTX-2
+model card and diffusers LTX2Pipeline docs:
+
+  Stage 1: base LTX-2 (Lightricks/LTX-2, 19B BF16) at HALF resolution,
+           40 steps, CFG 4.0, default scheduler, distilled LoRA
+           DISABLED. Output: video + audio latents.
+  Stage 1.5: LTX2LatentUpsamplePipeline doubles spatial dimensions.
+  Stage 2: same base pipe, FlowMatchEulerDiscreteScheduler (no dynamic
+           shifting), distilled LoRA ENABLED, 3 steps, CFG 1.0, sigmas
+           = STAGE_2_DISTILLED_SIGMA_VALUES, noise_scale = sigmas[0].
+           Output: video frames (np) + audio tensor.
+
+NOT FOR PRODUCTION USE. No persistent storage, no auth beyond a static
+bearer token, no queue, no retry. The runner machine drives load and
+captures all metrics.
 
 Endpoints
 ---------
 GET  /healthz   always 200 (liveness)
-GET  /readyz    200 once model is loaded, else 503
-GET  /info      model variant, dtype, peak VRAM, throughput counters
-POST /generate  text-to-video, optionally batched via num_videos_per_prompt
+GET  /readyz    200 once both pipes are loaded, else 503
+GET  /info      variant, dtype, peak VRAM, throughput + per-stage counters
+POST /generate  text-to-video (two-stage), single video per request
 
 Environment
 -----------
-POD_AUTH_TOKEN  required, shared secret with the runner
-LTX2_VARIANT    distilled-fp8 (default) | dev | distilled-bf16
-LTX2_REVISION   optional HF revision/tag (default main)
-HF_HOME         HF cache dir (default /workspace/hf)
-HF_TOKEN        optional HF token for gated weights
-PORT            default 8000
+POD_AUTH_TOKEN     required, shared secret with the runner
+LTX2_VARIANT       only "two-stage-distilled" is supported in this build
+LTX2_REVISION      optional HF revision/tag (default main)
+LTX2_BASE_OFFLOAD  "1" enables model_cpu_offload on the base pipe (saves
+                   VRAM on smaller GPUs; on 80 GB H100 leave off for speed)
+HF_HOME            HF cache dir (default /workspace/hf)
+HF_TOKEN           optional HF token for gated weights
+PORT               default 8000
 """
 
 from __future__ import annotations
@@ -30,9 +44,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
-import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,33 +66,41 @@ log = logging.getLogger("ltx2-pod")
 # ---------------------------------------------------------------------------
 
 POD_AUTH_TOKEN = os.environ.get("POD_AUTH_TOKEN", "")
-LTX2_VARIANT = os.environ.get("LTX2_VARIANT", "distilled-fp8").strip()
+LTX2_VARIANT = os.environ.get("LTX2_VARIANT", "two-stage-distilled").strip()
 LTX2_REVISION = os.environ.get("LTX2_REVISION", "main").strip()
 HF_HOME = os.environ.get("HF_HOME", "/workspace/hf")
 PORT = int(os.environ.get("PORT", "8000"))
+# Whether to call pipe.enable_model_cpu_offload on the BASE pipe. On 80 GB
+# H100 it fits without offload (faster); on smaller GPUs offload reduces
+# VRAM at the cost of latency. The latent upsampler always uses CPU offload.
+LTX2_BASE_OFFLOAD = os.environ.get("LTX2_BASE_OFFLOAD", "0").strip() == "1"
 
-# Variant → (huggingface model id, torch dtype, recommended sampler steps)
+# Two-stage production pipeline using the Lightricks 19B base + distilled
+# LoRA + 2x latent upsampler. This is the recommended path per the official
+# LTX-2 model card on HuggingFace and the diffusers LTX2Pipeline docs.
+#
+#   stage 1: base 40 steps, CFG 4.0          -> half-res latents
+#   stage 1.5: LTX2LatentUpsamplePipeline    -> full-res latents
+#   stage 2: base + distilled-LoRA, 3 steps, -> full-res pixels + audio
+#            CFG 1.0, sigmas = STAGE_2_DISTILLED_SIGMA_VALUES
+#
+# Single-stage and FP8 are intentionally NOT supported here. Reasons:
+#   - 8-step single-stage on the BASE checkpoint produces garbage; the 8
+#     steps only make sense WITH the distilled LoRA from rootonchair OR via
+#     two-stage with stage-2 sigmas.
+#   - FP8 in diffusers is not natively supported. Lightricks' own
+#     ltx-pipelines package has fp8-cast / fp8-scaled-mm modes but that's
+#     a different runtime (not diffusers).
 VARIANT_CONFIG: dict[str, dict[str, Any]] = {
-    "distilled-fp8": {
+    "two-stage-distilled": {
         "model_id": "Lightricks/LTX-2",
-        "weights_file": "ltx-2.3-22b-distilled-fp8.safetensors",
-        "dtype": "fp8_e4m3",
-        "num_inference_steps": 8,
-        "needs_ada_or_newer": True,
-    },
-    "distilled-bf16": {
-        "model_id": "Lightricks/LTX-2",
-        "weights_file": "ltx-2.3-22b-distilled-1.1.safetensors",
+        "lora_weight_name": "ltx-2-19b-distilled-lora-384.safetensors",
+        "lora_adapter_name": "stage_2_distilled",
         "dtype": "bfloat16",
-        "num_inference_steps": 8,
-        "needs_ada_or_newer": False,
-    },
-    "dev": {
-        "model_id": "Lightricks/LTX-2",
-        "weights_file": "ltx-2.3-22b-dev.safetensors",
-        "dtype": "bfloat16",
-        "num_inference_steps": 30,
-        "needs_ada_or_newer": False,
+        "stage1_steps": 40,
+        "stage1_cfg": 4.0,
+        "stage2_steps": 3,
+        "stage2_cfg": 1.0,
     },
 }
 
@@ -92,7 +112,13 @@ VARIANT_CONFIG: dict[str, dict[str, Any]] = {
 
 @dataclass
 class PipelineState:
-    pipeline: Any = None
+    pipeline: Any = None  # LTX2Pipeline with LoRA pre-loaded but disabled
+    upsample_pipe: Any = None  # LTX2LatentUpsamplePipeline
+    stage1_scheduler: Any = None  # default scheduler from the base pipe
+    stage2_scheduler: Any = None  # FlowMatchEulerDiscreteScheduler variant for stage 2
+    stage_2_sigmas: list[float] = field(default_factory=list)
+    audio_sample_rate: int = 24000
+    lora_adapter_name: str = ""
     variant: str = ""
     dtype: str = ""
     model_loaded_at_ms: int | None = None
@@ -106,6 +132,9 @@ class PipelineState:
             "videos_produced_total": 0,
             "inference_seconds_total": 0.0,
             "peak_vram_mb": 0,
+            "stage1_seconds_total": 0.0,
+            "upsample_seconds_total": 0.0,
+            "stage2_seconds_total": 0.0,
         }
     )
 
@@ -175,11 +204,22 @@ app = FastAPI(title="LTX-2 POC server", version="0.1.0")
 
 @app.on_event("startup")
 def _load_model_on_startup() -> None:
-    """Load the LTX-2 pipeline once at process start.
+    """Load the LTX-2 two-stage pipeline once at process start.
 
-    Lazy-loading on first /generate would block the runner for ~60-120s
-    on the first request and skew our latency measurements. Loading
-    upfront makes /readyz the source of truth for "is the pod hot?".
+    What we load:
+      1. Base LTX2Pipeline (Lightricks/LTX-2, ~19B, BF16) — used for both
+         stage 1 (default scheduler, LoRA off) and stage 2 (alt scheduler,
+         distilled LoRA on).
+      2. The stage-2 distilled LoRA weights, loaded into the base pipe but
+         left DISABLED until stage 2.
+      3. A second `FlowMatchEulerDiscreteScheduler` configured for stage 2
+         (use_dynamic_shifting=False, shift_terminal=None).
+      4. LTX2LatentUpsamplerModel + LTX2LatentUpsamplePipeline for 2x
+         spatial upsampling between stages.
+
+    Loading takes ~2 min (already cached) — we want /readyz to be the
+    source of truth for "is the pod hot?", so we pay this cost up front
+    instead of on the first /generate.
     """
     if not POD_AUTH_TOKEN:
         log.warning("POD_AUTH_TOKEN not set — server will reject all generate calls")
@@ -189,11 +229,14 @@ def _load_model_on_startup() -> None:
         log.error("Unknown LTX2_VARIANT=%r. Valid: %s", LTX2_VARIANT, list(VARIANT_CONFIG))
         sys.exit(2)
 
-    log.info("Loading LTX-2 variant=%s dtype=%s …", LTX2_VARIANT, cfg["dtype"])
+    log.info("Loading LTX-2 two-stage pipeline (variant=%s) …", LTX2_VARIANT)
     t0 = time.time()
 
     import torch
-    from diffusers import LTX2Pipeline
+    from diffusers import FlowMatchEulerDiscreteScheduler, LTX2Pipeline
+    from diffusers.pipelines.ltx2 import LTX2LatentUpsamplePipeline
+    from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+    from diffusers.pipelines.ltx2.utils import STAGE_2_DISTILLED_SIGMA_VALUES
 
     STATE.gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no-cuda"
     STATE.gpu_total_vram_mb = (
@@ -203,49 +246,84 @@ def _load_model_on_startup() -> None:
     )
     log.info("GPU: %s, total VRAM: %d MB", STATE.gpu_name, STATE.gpu_total_vram_mb)
 
-    # FP8 fallback: even with dict-typed torch_dtype (FP8 only on the
-    # transformer, BF16 elsewhere), the naive single-stage path fails with
-    # `RuntimeError: mat1 and mat2 must have the same dtype, but got
-    # BFloat16 and Float8_e4m3fn` at the transformer's first proj_in linear,
-    # because PyTorch's stock nn.Linear does not support mixed-dtype matmul.
-    # Real FP8 inference needs either Lightricks' own ltx-pipelines package
-    # with scaled FP8 kernels, or diffusers' two-stage distilled-LoRA
-    # pipeline (BF16 base + distilled LoRA + custom sigmas). Neither is in
-    # scope for this POC. When FP8 is requested we fall back to BF16 and
-    # surface it in /info so the operator knows what's actually running.
-    effective_dtype = cfg["dtype"]
-    if cfg["dtype"] == "fp8_e4m3":
-        log.warning(
-            "FP8 requested but unsupported via diffusers' single-stage "
-            "path (mixed BF16/FP8 matmul fails in nn.Linear). Falling "
-            "back to BF16. See the LTX-2 model card for the two-stage "
-            "distilled-LoRA approach if FP8 speed is needed."
-        )
-        effective_dtype = "bfloat16"
-    torch_dtype_param: Any = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-    }[effective_dtype]
+    torch_dtype = torch.bfloat16
 
+    # ---------- 1. Base pipeline ----------
+    log.info("Loading base LTX2Pipeline from %s", cfg["model_id"])
     pipe = LTX2Pipeline.from_pretrained(
         cfg["model_id"],
-        torch_dtype=torch_dtype_param,
+        torch_dtype=torch_dtype,
         cache_dir=HF_HOME,
         revision=LTX2_REVISION,
     )
-    pipe = pipe.to("cuda")
-
+    if LTX2_BASE_OFFLOAD:
+        log.info("Enabling model CPU offload on base pipe (LTX2_BASE_OFFLOAD=1)")
+        pipe.enable_model_cpu_offload(device="cuda")
+    else:
+        pipe = pipe.to("cuda")
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
-        # Tiled VAE decode keeps activation memory under control during the
-        # final upscale stage. Free real estate for batching.
         pipe.vae.enable_tiling()
 
+    # ---------- 2. Distilled stage-2 LoRA ----------
+    log.info("Loading stage-2 distilled LoRA (%s)", cfg["lora_weight_name"])
+    pipe.load_lora_weights(
+        cfg["model_id"],
+        adapter_name=cfg["lora_adapter_name"],
+        weight_name=cfg["lora_weight_name"],
+    )
+    # Start DISABLED — stage 1 must run on the base weights only.
+    pipe.set_adapters([cfg["lora_adapter_name"]], [0.0])
+
+    # ---------- 3. Schedulers ----------
+    # Stage 1 keeps the default scheduler the pipe was built with.
+    STATE.stage1_scheduler = pipe.scheduler
+    # Stage 2 needs a FlowMatchEulerDiscreteScheduler with the docs' specific
+    # config (dynamic shifting off, no shift terminal). Build it now so we
+    # don't pay reconfiguration cost on every request.
+    STATE.stage2_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+        pipe.scheduler.config,
+        use_dynamic_shifting=False,
+        shift_terminal=None,
+    )
+    STATE.stage_2_sigmas = list(STAGE_2_DISTILLED_SIGMA_VALUES)
+
+    # ---------- 4. Latent upsampler ----------
+    log.info("Loading latent upsampler (subfolder=latent_upsampler)")
+    latent_upsampler = LTX2LatentUpsamplerModel.from_pretrained(
+        cfg["model_id"],
+        subfolder="latent_upsampler",
+        torch_dtype=torch_dtype,
+        cache_dir=HF_HOME,
+    )
+    upsample_pipe = LTX2LatentUpsamplePipeline(
+        vae=pipe.vae,
+        latent_upsampler=latent_upsampler,
+    )
+    # Upsampler always uses CPU offload — it's only needed between stage 1
+    # and stage 2, never concurrent with either; offload saves VRAM during
+    # the big stages.
+    upsample_pipe.enable_model_cpu_offload(device="cuda")
+
+    # ---------- 5. Audio sample rate ----------
+    try:
+        STATE.audio_sample_rate = int(pipe.vocoder.config.output_sampling_rate)
+    except AttributeError:
+        log.warning("pipe.vocoder.config.output_sampling_rate missing — defaulting to 24000")
+        STATE.audio_sample_rate = 24000
+
     STATE.pipeline = pipe
+    STATE.upsample_pipe = upsample_pipe
+    STATE.lora_adapter_name = cfg["lora_adapter_name"]
     STATE.variant = LTX2_VARIANT
-    STATE.dtype = effective_dtype  # what we actually loaded, after FP8 fallback
+    STATE.dtype = "bfloat16"
     STATE.load_duration_ms = int((time.time() - t0) * 1000)
     STATE.model_loaded_at_ms = int(time.time() * 1000)
-    log.info("Pipeline ready in %.1fs", STATE.load_duration_ms / 1000.0)
+    log.info(
+        "Pipeline ready in %.1fs  audio_sr=%d  base_offload=%s",
+        STATE.load_duration_ms / 1000.0,
+        STATE.audio_sample_rate,
+        LTX2_BASE_OFFLOAD,
+    )
 
 
 def _require_auth(authorization: str | None) -> None:
@@ -280,105 +358,92 @@ def _round32(x: int) -> int:
     return max(32, ((x + 16) // 32) * 32)
 
 
-def _resolution_to_hw(resolution: str, aspect_ratio: str) -> tuple[int, int]:
-    """Map shorthand → LTX-2 (width, height), snapped to multiples of 32.
+def _resolution_to_stage_dims(
+    resolution: str,
+    aspect_ratio: str,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Map shorthand → ((stage1_w, stage1_h), (stage2_w, stage2_h)).
 
-    Convention: "720p" / "1080p" labels the SHORT side, matching how phone
-    portrait video is talked about (e.g. 1080p portrait = 1080 wide × 1920
-    tall, not 1080 tall × 607 wide).
+    LTX-2's two-stage pipeline runs stage 1 at half resolution, then the
+    latent upsampler doubles W and H, so stage 2 is at the full target.
+    Both stages must be mod-32 — we snap the half-size and use exactly 2×
+    for stage 2 to guarantee both are valid.
+
+    "720p" / "1080p" labels the SHORT side (phone portrait convention:
+    1080p portrait = 1080 wide × 1920 tall).
     """
     short_side = {"720p": 720, "1080p": 1080}[resolution]
     long_side = short_side * 16 // 9  # 1280 for 720p, 1920 for 1080p
     if aspect_ratio == "9:16":
-        w, h = short_side, long_side
+        full_w, full_h = short_side, long_side
     elif aspect_ratio == "16:9":
-        w, h = long_side, short_side
+        full_w, full_h = long_side, short_side
     else:  # "1:1"
-        w, h = short_side, short_side
-    return _round32(w), _round32(h)
+        full_w, full_h = short_side, short_side
+    # Stage 1 = half, snapped to mod 32. Stage 2 = exactly 2× stage 1.
+    stage1_w = _round32(full_w // 2)
+    stage1_h = _round32(full_h // 2)
+    stage2_w = stage1_w * 2
+    stage2_h = stage1_h * 2
+    return (stage1_w, stage1_h), (stage2_w, stage2_h)
 
 
-def _encode_video(
-    frames: Any,
-    audio: Any,
+def _encode_mp4_bytes(
+    frames_np: Any,
+    audio_tensor: Any,
     fps: int,
-    out_dir: Path,
-    index: int,
-) -> tuple[Path, int, int, bool]:
-    """Write a numpy/tensor frame sequence (+ optional audio) to mp4.
+    audio_sample_rate: int,
+) -> bytes:
+    """Write a numpy frame sequence + optional audio tensor to MP4 bytes.
 
-    Returns (path, mux_ms, frame_count, has_audio).
+    Uses diffusers' `encode_video()` helper, which handles audio resampling
+    and stream muxing the same way Lightricks does it internally. Falls
+    back to silent export if audio is missing.
     """
-    from diffusers.utils import export_to_video
+    import tempfile
+    from diffusers.pipelines.ltx2.export_utils import encode_video
 
-    silent_path = out_dir / f"video_{index}_silent.mp4"
-    export_to_video(frames, str(silent_path), fps=fps)
-    frame_count = len(frames) if hasattr(frames, "__len__") else 0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = Path(tmpdir) / "out.mp4"
+        if audio_tensor is None:
+            # No audio → still use export_to_video for the video-only path
+            # so we don't ship two muxing paths.
+            from diffusers.utils import export_to_video
 
-    if audio is None:
-        return silent_path, 0, frame_count, False
+            export_to_video(frames_np, str(out_path), fps=fps)
+        else:
+            try:
+                import torch as _torch
 
-    audio_path = out_dir / f"audio_{index}.wav"
-    _write_audio_wav(audio, audio_path)
-
-    final_path = out_dir / f"video_{index}.mp4"
-    mux_t0 = time.time()
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(silent_path),
-            "-i",
-            str(audio_path),
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            str(final_path),
-        ],
-        check=True,
-    )
-    mux_ms = int((time.time() - mux_t0) * 1000)
-    return final_path, mux_ms, frame_count, True
+                if isinstance(audio_tensor, _torch.Tensor):
+                    audio_np = audio_tensor.float().cpu()
+                else:
+                    audio_np = audio_tensor
+            except Exception:
+                audio_np = audio_tensor
+            encode_video(
+                frames_np,
+                fps=float(fps),
+                audio=audio_np,
+                audio_sample_rate=audio_sample_rate,
+                output_path=str(out_path),
+            )
+        return out_path.read_bytes()
 
 
-def _select_video_frames(videos_frames: Any, i: int) -> Any:
-    """Pick the i-th video out of a diffusers LTX-2 frames result.
-
-    The pipeline returns either a list (length = num_videos_per_prompt)
-    of per-video frame arrays, OR a single tensor/array with batch as
-    the leading dimension when num_videos_per_prompt > 1. Handle both.
+def _set_stage(stage: int) -> None:
+    """Configure the base pipe for stage 1 (LoRA off, default sched) or
+    stage 2 (LoRA on, FlowMatchEuler variant). Idempotent across requests.
     """
-    if isinstance(videos_frames, list):
-        return videos_frames[i]
-    if hasattr(videos_frames, "ndim") and videos_frames.ndim == 5:
-        return videos_frames[i]
-    return videos_frames
-
-
-def _write_audio_wav(audio: Any, dest: Path) -> None:
-    """Write LTX-2 audio output to a WAV file at 24 kHz stereo.
-
-    The diffusers LTX2 pipeline returns audio as a torch tensor of shape
-    `(channels, samples)` or `(samples,)`. We accept both.
-    """
-    import soundfile as sf
-    import torch
-
-    if isinstance(audio, torch.Tensor):
-        audio = audio.detach().cpu().numpy()
-    if audio.ndim == 1:
-        audio = audio.reshape(-1, 1)
-    elif audio.ndim == 2 and audio.shape[0] in (1, 2) and audio.shape[1] > 2:
-        audio = audio.T
-    sf.write(str(dest), audio, samplerate=24000)
+    pipe = STATE.pipeline
+    if stage == 1:
+        pipe.scheduler = STATE.stage1_scheduler
+        pipe.set_adapters([STATE.lora_adapter_name], [0.0])
+    elif stage == 2:
+        pipe.scheduler = STATE.stage2_scheduler
+        pipe.set_adapters([STATE.lora_adapter_name], [1.0])
+    else:
+        raise ValueError(f"Unknown stage {stage}")
 
 
 # ---------------------------------------------------------------------------
@@ -420,26 +485,50 @@ def generate(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> GenerateResponse:
+    """Two-stage LTX-2 generation: base → upsample → distilled-LoRA stage 2.
+
+    The pipeline contract follows the official LTX-2 model card:
+      - Stage 1 runs at HALF the requested final resolution, 40 steps,
+        CFG 4.0, default scheduler, no LoRA. Output: latents.
+      - The latent upsampler doubles W and H spatially.
+      - Stage 2 runs at the FULL final resolution, 3 steps, CFG 1.0,
+        FlowMatchEulerDiscreteScheduler (no dynamic shifting), distilled
+        LoRA enabled, using STAGE_2_DISTILLED_SIGMA_VALUES and
+        noise_scale=sigmas[0] to renoise the upscaled latent.
+    """
     _require_auth(authorization)
     if STATE.pipeline is None:
         raise HTTPException(status_code=503, detail="pipeline not loaded")
 
     cfg = VARIANT_CONFIG[STATE.variant]
-    width, height = _resolution_to_hw(request_body.resolution, request_body.aspect_ratio)
+    if request_body.num_videos_per_prompt != 1:
+        # Diffusers LTX2Pipeline supports num_videos_per_prompt > 1 in
+        # principle, but the two-stage flow is single-batch in every
+        # documented example. Reject for now to keep the pipeline path
+        # deterministic; we can revisit batching later for the eval run.
+        raise HTTPException(
+            status_code=400,
+            detail="num_videos_per_prompt > 1 is not supported by the two-stage pipeline",
+        )
+
+    (stage1_w, stage1_h), (stage2_w, stage2_h) = _resolution_to_stage_dims(
+        request_body.resolution, request_body.aspect_ratio
+    )
+    # LTX-2: num_frames must be (8k + 1). Round to NEAREST valid value.
     raw_frames = request_body.duration_seconds * request_body.fps
-    # LTX-2 constraint: num_frames must be (8k + 1) — 9, 17, 25, …, 121, …, 241.
-    # Round to NEAREST valid value to preserve user-requested duration as
-    # closely as possible.
     num_frames = max(9, ((raw_frames - 1 + 4) // 8) * 8 + 1)
+    frame_rate = float(request_body.fps)
 
     log.info(
-        "generate variant=%s prompt=%r dur=%ds res=%s ar=%s batch=%d audio=%s seed=%d",
-        STATE.variant,
+        "generate prompt=%r dur=%ds (%d frames) fr=%.1f s1=%dx%d s2=%dx%d audio=%s seed=%d",
         request_body.prompt[:60] + ("…" if len(request_body.prompt) > 60 else ""),
         request_body.duration_seconds,
-        request_body.resolution,
-        request_body.aspect_ratio,
-        request_body.num_videos_per_prompt,
+        num_frames,
+        frame_rate,
+        stage1_w,
+        stage1_h,
+        stage2_w,
+        stage2_h,
         request_body.audio_enabled,
         request_body.seed,
     )
@@ -448,67 +537,112 @@ def generate(
 
     _reset_peak_vram()
     wall_t0 = time.time()
+    pipe = STATE.pipeline
+    upsample_pipe = STATE.upsample_pipe
 
     try:
         generator = torch.Generator(device="cuda").manual_seed(request_body.seed)
-        inf_t0 = time.time()
+
+        # ----- Stage 1 -----
+        _set_stage(1)
+        s1_t0 = time.time()
         with torch.no_grad():
-            result = STATE.pipeline(
+            video_latent, audio_latent = pipe(
                 prompt=request_body.prompt,
                 negative_prompt=request_body.negative_prompt or None,
-                width=width,
-                height=height,
+                width=stage1_w,
+                height=stage1_h,
                 num_frames=num_frames,
-                num_inference_steps=cfg["num_inference_steps"],
-                num_videos_per_prompt=request_body.num_videos_per_prompt,
-                guidance_scale=request_body.guidance_scale_video,
+                frame_rate=frame_rate,
+                num_inference_steps=int(cfg["stage1_steps"]),
+                sigmas=None,
+                guidance_scale=float(cfg["stage1_cfg"]),
+                generator=generator,
+                output_type="latent",
+                return_dict=False,
+            )
+        stage1_ms = int((time.time() - s1_t0) * 1000)
+
+        # ----- Stage 1.5: latent upsampling -----
+        up_t0 = time.time()
+        with torch.no_grad():
+            (upscaled_video_latent,) = upsample_pipe(
+                latents=video_latent,
+                output_type="latent",
+                return_dict=False,
+            )
+        upsample_ms = int((time.time() - up_t0) * 1000)
+
+        # ----- Stage 2 -----
+        _set_stage(2)
+        s2_t0 = time.time()
+        with torch.no_grad():
+            video, audio = pipe(
+                latents=upscaled_video_latent,
+                audio_latents=audio_latent,
+                prompt=request_body.prompt,
+                negative_prompt=request_body.negative_prompt or None,
+                width=stage2_w,
+                height=stage2_h,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                num_inference_steps=int(cfg["stage2_steps"]),
+                sigmas=STATE.stage_2_sigmas,
+                noise_scale=STATE.stage_2_sigmas[0],
+                guidance_scale=float(cfg["stage2_cfg"]),
                 generator=generator,
                 output_type="np",
-                return_dict=True,
+                return_dict=False,
             )
-        inference_ms = int((time.time() - inf_t0) * 1000)
+        stage2_ms = int((time.time() - s2_t0) * 1000)
+        inference_ms = stage1_ms + upsample_ms + stage2_ms
 
-        videos_frames = getattr(result, "frames", None) or result["frames"]
-        audios = getattr(result, "audio", None) if request_body.audio_enabled else None
-        if isinstance(audios, (list, tuple)) and len(audios) != request_body.num_videos_per_prompt:
-            audios = None
-        if audios is None:
-            audios = [None] * request_body.num_videos_per_prompt
+        # video is a list of numpy arrays (frames, H, W, 3); audio is a list
+        # of torch tensors. With num_videos_per_prompt=1, take index 0.
+        video_frames = video[0]
+        audio_track = audio[0] if (request_body.audio_enabled and audio is not None) else None
+        frame_count = int(video_frames.shape[0]) if hasattr(video_frames, "shape") else len(video_frames)
 
-        decode_t0 = time.time()
-        outputs: list[VideoOutput] = []
-        total_mux_ms = 0
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            for i in range(request_body.num_videos_per_prompt):
-                frames_i = _select_video_frames(videos_frames, i)
-                path, mux_ms, frame_count, has_audio = _encode_video(
-                    frames=frames_i,
-                    audio=audios[i],
-                    fps=request_body.fps,
-                    out_dir=tmp,
-                    index=i,
-                )
-                total_mux_ms += mux_ms
-                outputs.append(
-                    VideoOutput(
-                        index=i,
-                        data_b64=base64.b64encode(path.read_bytes()).decode("ascii"),
-                        frames=frame_count,
-                        width=width,
-                        height=height,
-                        fps=request_body.fps,
-                        has_audio=has_audio,
-                    )
-                )
-        decode_ms = int((time.time() - decode_t0) * 1000) - total_mux_ms
+        mux_t0 = time.time()
+        mp4_bytes = _encode_mp4_bytes(
+            frames_np=video_frames,
+            audio_tensor=audio_track,
+            fps=request_body.fps,
+            audio_sample_rate=STATE.audio_sample_rate,
+        )
+        mux_ms = int((time.time() - mux_t0) * 1000)
+
         wall_ms = int((time.time() - wall_t0) * 1000)
         peak_vram = _peak_vram_mb()
+        outputs = [
+            VideoOutput(
+                index=0,
+                data_b64=base64.b64encode(mp4_bytes).decode("ascii"),
+                frames=frame_count,
+                width=stage2_w,
+                height=stage2_h,
+                fps=request_body.fps,
+                has_audio=audio_track is not None,
+            )
+        ]
 
         STATE.counters["generations_total"] += 1
-        STATE.counters["videos_produced_total"] += len(outputs)
+        STATE.counters["videos_produced_total"] += 1
         STATE.counters["inference_seconds_total"] += inference_ms / 1000.0
+        STATE.counters["stage1_seconds_total"] += stage1_ms / 1000.0
+        STATE.counters["upsample_seconds_total"] += upsample_ms / 1000.0
+        STATE.counters["stage2_seconds_total"] += stage2_ms / 1000.0
         STATE.counters["peak_vram_mb"] = max(STATE.counters["peak_vram_mb"], peak_vram)
+
+        log.info(
+            "generate done wall=%dms s1=%dms up=%dms s2=%dms mux=%dms peak_vram=%dMB",
+            wall_ms,
+            stage1_ms,
+            upsample_ms,
+            stage2_ms,
+            mux_ms,
+            peak_vram,
+        )
 
         return GenerateResponse(
             variant=STATE.variant,
@@ -517,18 +651,29 @@ def generate(
             metrics=GenerateMetrics(
                 wall_clock_ms=wall_ms,
                 inference_ms=inference_ms,
-                decode_ms=decode_ms,
-                mux_ms=total_mux_ms,
+                decode_ms=stage2_ms,  # final decode happens inside stage 2
+                mux_ms=mux_ms,
                 peak_vram_mb=peak_vram,
-                num_inference_steps=cfg["num_inference_steps"],
-                batch_size=request_body.num_videos_per_prompt,
+                num_inference_steps=int(cfg["stage1_steps"]) + int(cfg["stage2_steps"]),
+                batch_size=1,
             ),
         )
 
     except Exception as exc:
         STATE.counters["generations_failed"] += 1
         log.exception("generate failed: %r", exc)
+        # Best-effort: restore stage 1 settings so the next request starts clean.
+        try:
+            _set_stage(1)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"generation_failed: {exc!r}") from exc
+    finally:
+        # Always leave the pipe in stage-1 state for the next caller.
+        try:
+            _set_stage(1)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
