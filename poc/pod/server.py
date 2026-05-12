@@ -203,15 +203,30 @@ def _load_model_on_startup() -> None:
     )
     log.info("GPU: %s, total VRAM: %d MB", STATE.gpu_name, STATE.gpu_total_vram_mb)
 
-    torch_dtype = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "fp8_e4m3": torch.float8_e4m3fn,
-    }[cfg["dtype"]]
+    if cfg["dtype"] == "fp8_e4m3":
+        # FP8 cannot be a global torch default dtype — PyTorch 2.8 has FP8
+        # *tensor* types but no Float8_e4m3fnStorage backend, so
+        # `torch.set_default_dtype(torch.float8_e4m3fn)` raises TypeError.
+        # diffusers' default behavior is to cascade torch_dtype into every
+        # sub-module, including the T5 text encoder (a `transformers` model
+        # which calls set_default_dtype during from_pretrained → crash).
+        # Workaround: dict-typed torch_dtype puts FP8 only on the diffusion
+        # transformer; text encoder + VAE stay in BF16.
+        torch_dtype_param: Any = {
+            "transformer": torch.float8_e4m3fn,
+            "text_encoder": torch.bfloat16,
+            "vae": torch.bfloat16,
+            "default": torch.bfloat16,
+        }
+    else:
+        torch_dtype_param = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }[cfg["dtype"]]
 
     pipe = LTX2Pipeline.from_pretrained(
         cfg["model_id"],
-        torch_dtype=torch_dtype,
+        torch_dtype=torch_dtype_param,
         cache_dir=HF_HOME,
         revision=LTX2_REVISION,
     )
