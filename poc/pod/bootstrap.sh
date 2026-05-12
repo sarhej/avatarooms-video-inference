@@ -124,7 +124,22 @@ show_disk
 
 log "Installing Python deps from poc/pod/requirements.txt"
 python3 -m pip install --upgrade --quiet pip
-python3 -m pip install --quiet -r poc/pod/requirements.txt
+# Force-reinstall diffusers from git main. The default pip behavior is to
+# treat any installed `diffusers` package as satisfying the `diffusers @ git+...`
+# constraint, so an old PyPI 0.36.0 wheel stays in place. --force-reinstall
+# guarantees we end up with the actual git-main commit.
+log "Force-reinstalling diffusers from git main"
+python3 -m pip uninstall -y diffusers 2>&1 | tail -2 || true
+python3 -m pip install -r poc/pod/requirements.txt 2>&1 | grep -E "(Successfully installed|already satisfied|ERROR|Collecting diffusers|Building wheel)" | head -20
+
+log "Installed versions (diffusers / torch / transformers / accelerate)"
+python3 -m pip show diffusers torch transformers accelerate 2>/dev/null | \
+  grep -E "^(Name|Version|Location):" | sed 's/^/    /'
+
+log "Python interpreter info"
+which python3
+python3 -c 'import sys; print("    sys.executable:", sys.executable); print("    sys.version:", sys.version)'
+
 log "Disk state after pip install"
 show_disk
 
