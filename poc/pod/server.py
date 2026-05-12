@@ -203,26 +203,29 @@ def _load_model_on_startup() -> None:
     )
     log.info("GPU: %s, total VRAM: %d MB", STATE.gpu_name, STATE.gpu_total_vram_mb)
 
+    # FP8 fallback: even with dict-typed torch_dtype (FP8 only on the
+    # transformer, BF16 elsewhere), the naive single-stage path fails with
+    # `RuntimeError: mat1 and mat2 must have the same dtype, but got
+    # BFloat16 and Float8_e4m3fn` at the transformer's first proj_in linear,
+    # because PyTorch's stock nn.Linear does not support mixed-dtype matmul.
+    # Real FP8 inference needs either Lightricks' own ltx-pipelines package
+    # with scaled FP8 kernels, or diffusers' two-stage distilled-LoRA
+    # pipeline (BF16 base + distilled LoRA + custom sigmas). Neither is in
+    # scope for this POC. When FP8 is requested we fall back to BF16 and
+    # surface it in /info so the operator knows what's actually running.
+    effective_dtype = cfg["dtype"]
     if cfg["dtype"] == "fp8_e4m3":
-        # FP8 cannot be a global torch default dtype — PyTorch 2.8 has FP8
-        # *tensor* types but no Float8_e4m3fnStorage backend, so
-        # `torch.set_default_dtype(torch.float8_e4m3fn)` raises TypeError.
-        # diffusers' default behavior is to cascade torch_dtype into every
-        # sub-module, including the T5 text encoder (a `transformers` model
-        # which calls set_default_dtype during from_pretrained → crash).
-        # Workaround: dict-typed torch_dtype puts FP8 only on the diffusion
-        # transformer; text encoder + VAE stay in BF16.
-        torch_dtype_param: Any = {
-            "transformer": torch.float8_e4m3fn,
-            "text_encoder": torch.bfloat16,
-            "vae": torch.bfloat16,
-            "default": torch.bfloat16,
-        }
-    else:
-        torch_dtype_param = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-        }[cfg["dtype"]]
+        log.warning(
+            "FP8 requested but unsupported via diffusers' single-stage "
+            "path (mixed BF16/FP8 matmul fails in nn.Linear). Falling "
+            "back to BF16. See the LTX-2 model card for the two-stage "
+            "distilled-LoRA approach if FP8 speed is needed."
+        )
+        effective_dtype = "bfloat16"
+    torch_dtype_param: Any = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[effective_dtype]
 
     pipe = LTX2Pipeline.from_pretrained(
         cfg["model_id"],
@@ -239,7 +242,7 @@ def _load_model_on_startup() -> None:
 
     STATE.pipeline = pipe
     STATE.variant = LTX2_VARIANT
-    STATE.dtype = cfg["dtype"]
+    STATE.dtype = effective_dtype  # what we actually loaded, after FP8 fallback
     STATE.load_duration_ms = int((time.time() - t0) * 1000)
     STATE.model_loaded_at_ms = int(time.time() * 1000)
     log.info("Pipeline ready in %.1fs", STATE.load_duration_ms / 1000.0)
@@ -423,7 +426,11 @@ def generate(
 
     cfg = VARIANT_CONFIG[STATE.variant]
     width, height = _resolution_to_hw(request_body.resolution, request_body.aspect_ratio)
-    num_frames = request_body.duration_seconds * request_body.fps
+    raw_frames = request_body.duration_seconds * request_body.fps
+    # LTX-2 constraint: num_frames must be (8k + 1) — 9, 17, 25, …, 121, …, 241.
+    # Round to NEAREST valid value to preserve user-requested duration as
+    # closely as possible.
+    num_frames = max(9, ((raw_frames - 1 + 4) // 8) * 8 + 1)
 
     log.info(
         "generate variant=%s prompt=%r dur=%ds res=%s ar=%s batch=%d audio=%s seed=%d",
