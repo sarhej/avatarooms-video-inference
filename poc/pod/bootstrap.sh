@@ -24,20 +24,47 @@ HF_HOME="${HF_HOME:-/workspace/hf}"
 LTX2_VARIANT="${LTX2_VARIANT:-distilled-fp8}"
 PORT="${PORT:-8000}"
 
-# Force every temp/cache directory we control onto the volume disk
-# (/workspace, 100+ GB) instead of the container root (/tmp on the 40 GB
-# container disk, which is what bit us before). HF's xet downloader writes
-# large temp files via _download_to_tmp_and_move during chunked downloads.
-export TMPDIR="${TMPDIR:-/workspace/tmp}"
-export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/pipcache}"
-mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}"
-
 log() { printf '\n[bootstrap] %s\n' "$*"; }
 
 show_disk() {
   echo "    df -h:"
   df -h / /workspace 2>/dev/null | sed 's/^/      /' || true
 }
+
+# ---------------------------------------------------------------------------
+# CRITICAL: cleanup partial state BEFORE any mkdir, because /workspace may
+# be 100% full from a previous failed HF download. mkdir would fail with
+# "No space left on device" before we get a chance to free space.
+# ---------------------------------------------------------------------------
+
+echo "[bootstrap] Pre-cleanup disk state"
+show_disk
+
+echo "[bootstrap] Removing partial state from prior failed runs (must run before any mkdir on /workspace)"
+rm -f /workspace/poc/.git/shallow.lock /workspace/poc/.git/index.lock 2>/dev/null || true
+if [[ -d /workspace/hf ]] && [[ ! -f /workspace/hf/.complete ]]; then
+  echo "    /workspace/hf exists but no .complete sentinel — wiping partial download"
+  rm -rf /workspace/hf 2>/dev/null || true
+fi
+if [[ -d /workspace/tmp ]]; then
+  echo "    wiping /workspace/tmp"
+  rm -rf /workspace/tmp 2>/dev/null || true
+fi
+if [[ -d /workspace/pipcache ]]; then
+  echo "    wiping /workspace/pipcache"
+  rm -rf /workspace/pipcache 2>/dev/null || true
+fi
+
+echo "[bootstrap] Post-cleanup disk state"
+show_disk
+
+# Now that we've freed space, route temp/cache dirs onto the volume disk
+# (/workspace, 100+ GB) instead of the container root (/tmp on the 40 GB
+# container disk). HF's xet downloader writes large temp files via
+# _download_to_tmp_and_move during chunked downloads.
+export TMPDIR="${TMPDIR:-/workspace/tmp}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/pipcache}"
+mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}"
 
 # ---------------------------------------------------------------------------
 # 0. Sanity checks
@@ -50,36 +77,12 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || {
 python3 --version
 python3 -c 'import torch, sys; print("torch", torch.__version__, "cuda", torch.cuda.is_available())'
 
-log "Disk state at start"
-show_disk
-
 if [[ -z "${POD_AUTH_TOKEN:-}" ]]; then
   echo "ERROR: POD_AUTH_TOKEN must be set"; exit 2
 fi
 if [[ -z "${HF_TOKEN:-}" ]]; then
   echo "ERROR: HF_TOKEN must be set (needed to download Lightricks/LTX-2)"; exit 2
 fi
-
-# ---------------------------------------------------------------------------
-# 0.5 Cleanup partial state from any previous failed runs
-# ---------------------------------------------------------------------------
-#
-# A previous crash-loop iteration may have left:
-#   - git locks (.git/shallow.lock, .git/index.lock) that block git fetch
-#   - half-downloaded HF chunks/temp files eating volume space
-# Wipe them so we always start each bootstrap cycle from a known state.
-
-log "Cleanup: removing partial state from prior failed runs"
-rm -f /workspace/poc/.git/shallow.lock /workspace/poc/.git/index.lock 2>/dev/null || true
-if [[ -d /workspace/hf ]] && [[ ! -f /workspace/hf/.complete ]]; then
-  echo "    /workspace/hf exists but no .complete sentinel — wiping partial download"
-  rm -rf /workspace/hf 2>/dev/null || true
-fi
-if [[ -d /workspace/tmp ]]; then
-  echo "    cleaning /workspace/tmp"
-  rm -rf /workspace/tmp/* 2>/dev/null || true
-fi
-show_disk
 
 # ---------------------------------------------------------------------------
 # 1. System packages
