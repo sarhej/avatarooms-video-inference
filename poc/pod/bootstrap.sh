@@ -20,9 +20,16 @@
 #   HF_TOKEN         HuggingFace token with read access to Lightricks/LTX-2
 #
 # Optional env vars:
-#   LTX2_VARIANT     two-stage-distilled (default)
-#   LTX2_BASE_OFFLOAD  1 enables model_cpu_offload on the base pipe
-#   PORT             default 8000
+#   LTX2_VARIANT            two-stage-distilled (default)
+#   LTX2_BASE_OFFLOAD       1 enables model_cpu_offload on the base pipe
+#                           (saves ~10-15 GB VRAM, costs +15-25s per gen)
+#   PYTORCH_CUDA_ALLOC_CONF defaults to expandable_segments:True; we set
+#                           this because we run at ~98% of H100 80GB and
+#                           the default segment allocator fragments after
+#                           the first OOM, making subsequent gens fail
+#                           with 850 MB free / 1004 MB needed. Override
+#                           if you have a reason.
+#   PORT                    default 8000
 
 set -euo pipefail
 
@@ -282,6 +289,16 @@ export POD_AUTH_TOKEN
 export LTX2_VARIANT
 export HF_HOME
 export PORT
+
+# CUDA memory allocator. We run at ~78.5 GB / 80 GB ceiling on H100 with
+# two-stage at 720p portrait + 10s clips. The default PyTorch segment
+# allocator fragments after the first OOM, leaving 2-3 GB of "reserved
+# but unallocated" memory that can't satisfy further requests. The
+# expandable_segments allocator extends existing segments rather than
+# creating new fixed-size ones, which is the recommended setting for
+# memory-constrained inference workloads.
+# Ref: https://pytorch.org/docs/stable/notes/cuda.html#environment-variables
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # Use nohup + tee so the user can disconnect their SSH/web shell and the
 # server keeps running. Logs to /workspace/poc/server.log so the runner

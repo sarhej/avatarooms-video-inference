@@ -130,7 +130,7 @@ echo $POD_AUTH_TOKEN   # ← keep this, you'll paste it into the RunPod env vars
    | Field | Value |
    |---|---|
    | Container image | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (prefilled by template) |
-   | Container Start Command | `bash -lc "curl -sSL 'https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh?v=5' -o /tmp/b.sh && bash /tmp/b.sh"` |
+   | Container Start Command | `bash -lc "curl -sSL 'https://raw.githubusercontent.com/sarhej/avatarooms-video-inference/main/poc/pod/bootstrap.sh?v=6' -o /tmp/b.sh && bash /tmp/b.sh"` |
    | Container disk | **40 GB** (apt + pip cache + system) |
    | **Volume disk** | **200 GB** ← critical, see disk-sizing note in cost section |
    | Volume mount path | `/workspace` |
