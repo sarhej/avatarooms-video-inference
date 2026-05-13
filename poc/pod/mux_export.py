@@ -12,12 +12,13 @@ LTX2_MUX_ENCODER
     to ``h264_nvenc``; on failure we log and fall back to libx264.
 
 LTX2_MUX_X264_PRESET
-    x264 preset name. Default: ``veryfast``. Use ``ultrafast`` for maximum
-    speed at POC quality; ``faster`` / ``fast`` if you want a bit more
-    compression efficiency.
+    x264 preset name. Default: ``fast`` (sharper / more efficient than
+    ``veryfast`` at the cost of slower mux). For throughput-first POC runs,
+    set ``veryfast``.
 
 LTX2_MUX_X264_CRF
-    Constant rate factor for libx264. Default: ``23``.
+    Constant rate factor for libx264. Default: ``19`` (sharper than ``23``,
+    larger files). Raise toward ``23`` if file size matters.
 
 LTX2_MUX_X264_TUNE
     Optional x264 ``tune`` value, e.g. ``film`` or ``zerolatency``. Empty
@@ -60,8 +61,12 @@ _mux_config_logged = False
 def _read_mux_env() -> dict[str, Any]:
     return {
         "encoder": os.environ.get("LTX2_MUX_ENCODER", "libx264").strip().lower(),
-        "x264_preset": os.environ.get("LTX2_MUX_X264_PRESET", "veryfast").strip(),
-        "x264_crf": os.environ.get("LTX2_MUX_X264_CRF", "23").strip(),
+        # Default ``fast`` + CRF 19: noticeably sharper / less banding than
+        # ``veryfast`` + CRF 23 at the cost of ~2-4x longer mux CPU time.
+        # For max throughput POC, set LTX2_MUX_X264_PRESET=veryfast and
+        # LTX2_MUX_X264_CRF=23 on the pod.
+        "x264_preset": os.environ.get("LTX2_MUX_X264_PRESET", "fast").strip(),
+        "x264_crf": os.environ.get("LTX2_MUX_X264_CRF", "19").strip(),
         "x264_tune": os.environ.get("LTX2_MUX_X264_TUNE", "").strip(),
         "x264_threads": os.environ.get("LTX2_MUX_THREADS", "0").strip(),
         "nvenc_preset": os.environ.get("LTX2_MUX_NVENC_PRESET", "p4").strip(),

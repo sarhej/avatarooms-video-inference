@@ -69,6 +69,13 @@ LTX2_MUX_NVENC_PRESET       NVENC preset ``p1``-``p7``; default ``p4``
 LTX2_MUX_NVENC_CQ           NVENC CQ when using VBR; default ``28``
 LTX2_MUX_PROGRESS           ``1`` to show tqdm during mux (noisy logs)
 LTX2_MUX_VIDEO_CHUNKS       time-chunk count (default ``1``; >1 rarely helps)
+
+single-stage-dev tuning (optional overrides for ``single-stage-dev`` only)
+---------------------------------------------------------------------------
+LTX2_DEV_STEPS              override denoise step count (integer; clamped
+                            15–60; default: variant value in VARIANT_CONFIG)
+LTX2_DEV_CFG                override guidance scale (float; clamped 3.0–10.0;
+                            default: variant value in VARIANT_CONFIG)
 """
 
 from __future__ import annotations
@@ -158,13 +165,17 @@ VARIANT_CONFIG: dict[str, dict[str, Any]] = {
         # LoRA. ~5-7x slower than distilled but visibly higher quality.
         # Use this for premium tier, A/B comparisons, and any case where
         # quality > cost. Frees ~5 GB VRAM at load (no LoRA, no upsampler).
+        #
+        # Defaults below bias toward sharper detail vs the old 30/5.0 pair
+        # (which read slightly soft on some scenes). Override per pod with
+        # LTX2_DEV_STEPS / LTX2_DEV_CFG without editing code.
         "pipeline_mode": "single_stage_dev",
         "model_id": "Lightricks/LTX-2",
         "lora_weight_name": None,
         "lora_adapter_name": None,
         "dtype": "bfloat16",
-        "steps": 30,
-        "cfg": 5.0,
+        "steps": 38,
+        "cfg": 6.0,
     },
 }
 
@@ -924,8 +935,14 @@ def _execute_single_stage_dev(
     num_frames = max(9, ((raw_frames - 1 + 4) // 8) * 8 + 1)
     frame_rate = float(req.fps)
 
-    steps = int(cfg["steps"])
-    cfg_scale = float(cfg["cfg"])
+    base_steps = int(cfg["steps"])
+    base_cfg = float(cfg["cfg"])
+    if os.environ.get("LTX2_DEV_STEPS", "").strip():
+        base_steps = int(os.environ["LTX2_DEV_STEPS"].strip())
+    if os.environ.get("LTX2_DEV_CFG", "").strip():
+        base_cfg = float(os.environ["LTX2_DEV_CFG"].strip())
+    steps = max(15, min(60, base_steps))
+    cfg_scale = max(3.0, min(10.0, base_cfg))
 
     log.info(
         "generate(dev) prompt=%r dur=%ds (%d frames) fr=%.1f wxh=%dx%d steps=%d cfg=%.1f audio=%s seed=%d",
