@@ -55,6 +55,20 @@ LTX2_JOB_REGISTRY_MAX_SIZE  hard cap on number of jobs in memory
 HF_HOME                     HF cache dir (default /workspace/hf)
 HF_TOKEN                    optional HF token for gated weights
 PORT                        default 8000
+
+MP4 mux (after diffusion; see ``mux_export.py``)
+----------------------------------------------
+LTX2_MUX_ENCODER            ``libx264`` (default) or ``h264_nvenc`` (GPU;
+                            auto-fallback to libx264 on failure)
+LTX2_MUX_X264_PRESET        libx264 preset; default ``veryfast`` (much faster
+                            than implicit ``medium`` used by stock helpers)
+LTX2_MUX_X264_CRF           default ``23``
+LTX2_MUX_X264_TUNE          optional, e.g. ``film`` or ``zerolatency``
+LTX2_MUX_THREADS            x264 threads string; default ``0`` (auto)
+LTX2_MUX_NVENC_PRESET       NVENC preset ``p1``-``p7``; default ``p4``
+LTX2_MUX_NVENC_CQ           NVENC CQ when using VBR; default ``28``
+LTX2_MUX_PROGRESS           ``1`` to show tqdm during mux (noisy logs)
+LTX2_MUX_VIDEO_CHUNKS       time-chunk count (default ``1``; >1 rarely helps)
 """
 
 from __future__ import annotations
@@ -608,38 +622,38 @@ def _encode_mp4_bytes(
 ) -> bytes:
     """Write a numpy frame sequence + optional audio tensor to MP4 bytes.
 
-    Uses diffusers' `encode_video()` helper, which handles audio resampling
-    and stream muxing the same way Lightricks does it internally. Falls
-    back to silent export if audio is missing.
+    Uses our ``mux_export.encode_mp4_file`` (PyAV), derived from diffusers'
+    LTX-2 export helper but with explicit **libx264 preset** (default
+    ``veryfast``) and optional **h264_nvenc** via ``LTX2_MUX_*`` env vars —
+    avoids spending minutes in mux on the implicit x264 ``medium`` preset.
     """
     import tempfile
-    from diffusers.pipelines.ltx2.export_utils import encode_video
+
+    from mux_export import encode_mp4_file
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_path = Path(tmpdir) / "out.mp4"
-        if audio_tensor is None:
-            # No audio → still use export_to_video for the video-only path
-            # so we don't ship two muxing paths.
-            from diffusers.utils import export_to_video
-
-            export_to_video(frames_np, str(out_path), fps=fps)
-        else:
+        audio = None
+        asr: int | None = None
+        if audio_tensor is not None:
             try:
                 import torch as _torch
 
                 if isinstance(audio_tensor, _torch.Tensor):
-                    audio_np = audio_tensor.float().cpu()
+                    audio = audio_tensor.float().cpu()
                 else:
-                    audio_np = audio_tensor
+                    audio = audio_tensor
             except Exception:
-                audio_np = audio_tensor
-            encode_video(
-                frames_np,
-                fps=float(fps),
-                audio=audio_np,
-                audio_sample_rate=audio_sample_rate,
-                output_path=str(out_path),
-            )
+                audio = audio_tensor
+            asr = int(audio_sample_rate)
+
+        encode_mp4_file(
+            frames_np,
+            fps=float(fps),
+            audio=audio,
+            audio_sample_rate=asr,
+            output_path=out_path,
+        )
         return out_path.read_bytes()
 
 

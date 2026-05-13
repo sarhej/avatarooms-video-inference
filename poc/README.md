@@ -148,6 +148,8 @@ echo $POD_AUTH_TOKEN   # ← keep this, you'll paste it into the RunPod env vars
    | `LTX2_VARIANT` | `two-stage-distilled` |
    | `PORT` | `8000` |
    | `LTX2_BASE_OFFLOAD` | `0` |
+   | `LTX2_MUX_X264_PRESET` *(optional)* | `veryfast` — faster CPU mux after diffusion (default if unset) |
+   | `LTX2_MUX_ENCODER` *(optional)* | `libx264` or `h264_nvenc` (GPU encode; falls back on error) |
 
 6. Triple-check **Volume disk = 200 GB** before clicking Deploy — RunPod has
    a habit of silently resetting that field if you tab through other inputs.
